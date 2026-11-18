@@ -3,6 +3,9 @@ cmake_minimum_required(VERSION 3.21)
 # God Hand (USA, SLUS-21503) native PC port. Adapted from the Urban Reign port's top-level CMakeLists.txt
 # (forks/urban-reign-recomp @2fa53c4); GODHAND_PORT_NOTES.md lists what changed.
 project(GodHandPC LANGUAGES C CXX)
+if(MSVC AND DEFINED GODHAND_MSVC_INCLUDE_PREFIX)
+    set(CMAKE_CL_SHOWINCLUDES_PREFIX "${GODHAND_MSVC_INCLUDE_PREFIX}")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -34,10 +37,8 @@ set(PS2X_ENABLE_SCCACHE OFF CACHE BOOL "" FORCE)
 add_subdirectory(runtime EXCLUDE_FROM_ALL)
 add_subdirectory(src)
 
-# PCSX2's GS as pcsx2gs.dll (DX11), loaded at run time when [Video] Renderer=pcsx2. Optional and OFF: its wrapper still
-# carries Urban Reign's GameIndex fixes and serial (thirdparty/pcsx2-gs/compat/Bridge.cpp, HostStubs.cpp), and the
-# runtime falls back to its own GS when the DLL is missing (gs_pcsx2_backend.cpp, GSPcsx2Backend::Requested).
-option(GODHAND_PCSX2_GS "Build PCSX2's GS (pcsx2gs.dll)" OFF)
+# DirectX 11 is available alongside the native GS on Windows.
+option(GODHAND_PCSX2_GS "Build PCSX2's GS (pcsx2gs.dll)" ${WIN32})
 if(GODHAND_PCSX2_GS AND WIN32)
     if(NOT EXISTS "${CMAKE_SOURCE_DIR}/thirdparty/pcsx2-gs/CMakeLists.txt")
         message(FATAL_ERROR "GODHAND_PCSX2_GS=ON needs thirdparty/pcsx2-gs (copy it from the Urban Reign port)")

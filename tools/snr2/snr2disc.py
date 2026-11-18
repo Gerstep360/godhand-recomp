@@ -17,11 +17,28 @@ SECTOR = 2048
 
 class Disc:
     def __init__(self, iso_path: str):
+        self._open(open(iso_path, "rb"), iso_path)
+
+    @classmethod
+    def from_stream(cls, stream, description: str):
+        """Index a seekable stream that exposes the ISO9660 logical sectors."""
+        disc = cls.__new__(cls)
+        disc._open(stream, description)
+        return disc
+
+    def _open(self, stream, iso_path):
         self.iso_path = iso_path
-        self.f = open(iso_path, "rb")
+        self.f = stream
+        try:
+            self._index()
+        except BaseException:
+            self.f.close()
+            raise
+
+    def _index(self):
         self.root = self._read_root()
         if "_DATA.AFS" not in self.root:
-            raise ValueError("_DATA.AFS not in ISO root of %s" % iso_path)
+            raise ValueError("_DATA.AFS not in disc root of %s" % self.iso_path)
         lba, size = self.root["_DATA.AFS"]
         self.afs_base = lba * SECTOR
         self.afs_size = size

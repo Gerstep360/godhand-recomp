@@ -15,6 +15,7 @@ namespace ps2_host_input
         float x = 0.0f;
         float y = 0.0f;
         bool active = false;
+        bool combatClick = false;
     };
 
     void setRightStickInvertDefault(uint32_t axes);

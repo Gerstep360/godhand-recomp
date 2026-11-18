@@ -1,6 +1,8 @@
 # God Hand Recompiled
 
-**God Hand (PS2, 2006) running natively on PC. Not an emulator: the game's own code, rebuilt as a Windows program.**
+**God Hand (PS2, 2006) running on Windows as recompiled x64 code. The graphics and audio paths still rely on compatibility with the PS2's GS, VU1 and SPU2.**
+
+A separate [native PC scene](native/README.md) uses converted room geometry, Gene's animation and stereo music. This executable builds with raylib and reads the prepared PC assets directly.
 
 > [!WARNING]
 > **Work in progress.** Tested from the start of the game into stage 3, past the Gorilla Mask and Mad Midget Five boss fights, played
@@ -8,7 +10,7 @@
 > The rest of stage 3, later stages, the final bosses and the ending have not been played yet. Expect bugs, and please report them
 > (see [Reporting bugs](#reporting-bugs)).
 
-![God Hand running natively, the title screen](assets/title-screen.png)
+![God Hand running on Windows, the title screen](assets/title-screen.png)
 
 You need your own copy of the game (God Hand, USA version). **No game files are included here.**
 
@@ -115,6 +117,30 @@ python -I build.py build
 Double-click **`Start-God-Hand.cmd`**. Remember the first start can take a couple of minutes (see
 [Known issues](#known-issues)).
 
+The first launch installs your disc files into `build\port\bin\game_data\disc`. Once installed, the game opens
+those files directly. The ISO can be disconnected. To install the files ahead of time, run:
+
+```powershell
+.\build\port\bin\godhand.exe --prepare-data --iso "game\God Hand (USA).iso"
+```
+
+Use `--data <folder>` or `[Game] Data=` in `godhand.ini` to choose another installed location.
+`--iso <file>` on its own still opens the ISO directly for compatibility testing.
+
+The installed files preserve the original AFS resource archive and the logical locations requested by the recompiled
+game. DirectX 11 is the default Windows GPU device for the GS-compatible renderer. The graphics front end keeps
+the vertex state it needs from complete VU1 strips and fans and forwards the draw to the renderer. Five matrix
+operations used by camera and model code run as x64 SIMD routines. The rest of the animation system still uses
+the original formats and code.
+
+SPU2 registers and DMA timing still drive the audio. The host processes both channels of each decoded PCM block
+together and runs the reverb delay line, dry and wet mixing, and gain control in software. On x64 it uses SIMD
+to interpolate voice samples before the Windows audio backend plays them.
+
+For stereo device compensation, add `StereoOffsetMs=0` to `[Audio]` in `build\port\bin\godhand.ini`.
+A positive value delays the left channel to match a late right channel. A negative value delays the right channel.
+The range is −100 to 100 ms. The setting is applied to the final PCM stream at startup.
+
 Your saves are in `build\port\bin\memcards\`. Your control settings are in `build\port\bin\controls.ini`.
 
 ---
@@ -150,6 +176,12 @@ To quit, close the window.
 
 ## Troubleshooting
 
+Set `GODHAND_NATIVE_TRANSFORMS=0` to use the recompiled matrix operations when comparing behavior or diagnosing a regression.
+Set `PS2X_GS_PACKED_GEOMETRY=0` to compare DirectX 11 graphics with the general GIF decoder.
+Set `PS2X_PCSX2_DEVICE=dx12` under `[Runtime]` to use DirectX 12 with `Renderer=pcsx2`.
+This needs the x64 DXC libraries `dxcompiler.dll` and `dxil.dll` beside the executable or on the system.
+The bridge falls back to DirectX 11 if the libraries are missing or the DirectX 12 device fails to initialize.
+
 | Problem | What to do |
 |---------|------------|
 | "Wrong disc" message | Your image is a different version. Compare it with [DISC_HASHES.md](DISC_HASHES.md). |
@@ -170,10 +202,37 @@ Open an issue and attach the log of your last session: `build\port\bin\logs\play
 
 Some 3D effects run on the PS2's VU1 coprocessor. For full speed they are compiled ahead of time:
 
-1. Play with `PS2X_VU1_CAPTURE=<folder>` set. Programs that are still missing are also saved to
-   `build\port\bin\logs\vu1_missing\`: copy those `vu1_*.bin` files into the same folder.
-2. Build the tool: `python -I build.py configure -DGODHAND_BUILD_TOOLS=ON`, then `python -I build.py build vu1_recomp`.
-3. Run `build\port\runtime\ps2xTest\vu1_recomp.exe <folder> generated\vu1`, then `python -I build.py build`.
+1. Play the affected 3D scenes, then close the game. Missing programs are saved automatically to
+   `build\port\bin\logs\vu1_missing\`, including when the build has no VU AOT code at all.
+2. Run `python -I build.py vu1`. It collects the captures, runs the existing VU compiler and rebuilds the game.
+   To import earlier captures as well: `python -I build.py vu1 <capture-folder> [<another-folder> ...]`.
+
+The local corpus stays in `build\vu_corpus\`, so later captures add to previous ones. Only changed generated sources
+are rebuilt; the EE code and SNR2 modules are not regenerated. An incomplete corpus cannot replace an existing set of
+AOT programs. Keep the corpus when cleaning the build directory. Generated game code remains local and is not committed.
+Programs from scenes not captured yet still use the interpreter until you repeat these steps.
+
+On integrated graphics with shared RAM, start with `InternalResolution=1` in `build\port\bin\godhand.ini`.
+3x renders nine times as many internal samples as the native 1x default. Lower resolution does not cure a missing VU AOT build.
+Audio gaps during sustained slowdowns should be investigated alongside game speed; enlarging the audio buffer alone
+cannot supply the missing samples.
+
+Frame presentation uses shared GPU textures (`PS2X_GS_DIRECT_PRESENT=1`) to avoid downloading every frame to RAM and
+uploading it again. Use `0` for the compatibility path. The renderer also keeps a general hardware shader ready while
+new specialized effect shaders compile, instead of falling back to tile/compute rasterization for a whole batch.
+`PS2X_GS_HW_FALLBACK=0` restores the previous fallback for comparisons.
+
+`PS2X_GS_HW_PRELOAD=2` prepares previously seen shader states before gameplay, with an animated progress screen using the
+original US font loaded from the player's disc. The window keeps processing input while waiting for the GS worker.
+This can lengthen startup but avoids loading those programs for the first time during an effect or cinematic.
+Use `0` for on-demand loading or `1` for background preload. New effects can still require driver compilation on their
+first appearance; neither the VU compiler nor the game's timing or instructions are changed by these settings.
+
+Open the game's original **OPTIONS → CONTROLS** page to remap keyboard, mouse and controller inputs.
+The page is rendered from the original IDD resource by the game's own renderer; there is no separate F2 menu.
+**Tab / R1** switches between bindings and video settings. Resolution, shader preparation and the performance preset
+are saved in `godhand.ini` for the next start; fullscreen applies immediately. **Esc / B** saves bindings and returns
+through the original menu transition. The startup preparation dialog reuses the original memory-card window and font.
 
 ### How it works
 

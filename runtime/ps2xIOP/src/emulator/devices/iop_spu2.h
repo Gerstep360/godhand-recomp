@@ -1,5 +1,8 @@
 #pragma once
 
+#include "../../audio/stereo_pcm_stream.h"
+#include "../../audio/stereo_reverb.h"
+
 #include <array>
 #include "ps2x/state_io.h"
 #include <cstdint>
@@ -120,27 +123,9 @@ namespace ps2x::iop::detail
         std::array<int32_t, 2> reverbFrame(uint32_t core, const std::array<int32_t, 2> &wet);
         std::array<int32_t, 2> admaSample(uint32_t core);
 
-        struct Adma
-        {
-            const uint8_t *source = nullptr;
-            size_t bytes = 0u;
-            size_t position = 0u;
-            uint32_t index = 256u;
-            std::array<int16_t, 256> left{};
-            std::array<int16_t, 256> right{};
-        };
-        std::array<Adma, kCores> m_adma{};
+        std::array<audio::StereoPcmStream, kCores> m_adma{};
 
-        // Reverb unit state per core (iop_spu2.cpp, reverbFrame): 48 kHz wet input and zero-stuffed 24 kHz output
-        // histories for the 39-tap resampling filter, the work-area position and a frame counter.
-        struct Reverb
-        {
-            std::array<std::array<int16_t, 64>, 2> in{};
-            std::array<std::array<int16_t, 64>, 2> out{};
-            uint32_t current = 0u;
-            uint64_t frame = 0u;
-        };
-        std::array<Reverb, kCores> m_reverb{};
+        std::array<audio::StereoReverb, kCores> m_reverb{};
 
         std::array<uint16_t, 0x400> m_regs{};
         std::vector<uint16_t> m_ram;

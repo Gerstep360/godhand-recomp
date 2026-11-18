@@ -12,6 +12,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -568,3 +569,12 @@ namespace GSSharedPresent
     void ShutdownHost() {}
 }
 #endif
+
+bool GSGL::replaceCacheFile(const std::filesystem::path &temporary,const std::filesystem::path &destination)
+{
+#if defined(_WIN32)
+    return MoveFileExW(temporary.c_str(),destination.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0;
+#else
+    std::error_code error; std::filesystem::rename(temporary,destination,error); return !error;
+#endif
+}

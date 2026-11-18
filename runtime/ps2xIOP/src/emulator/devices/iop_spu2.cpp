@@ -1,5 +1,6 @@
 #include "iop_spu2.h"
 #include "../core/iop_cpu.h"
+#include "audio/stereo_mixer.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -15,6 +16,9 @@ namespace ps2x::iop::detail
 
     namespace
     {
+        using audio::saturate;
+        using audio::scale;
+
         constexpr uint32_t kCoreStride = 0x400u;
         constexpr uint32_t kSharedBase = 0x760u;
         constexpr uint32_t kVoiceParamsEnd = 0x180u;
@@ -82,16 +86,6 @@ namespace ps2x::iop::detail
             return static_cast<int16_t>(value << 1u);
         }
 
-        int32_t scale(int32_t sample, int32_t gain)
-        {
-            return static_cast<int32_t>((static_cast<int64_t>(sample) * gain) >> 15);
-        }
-
-        int32_t saturate(int32_t sample)
-        {
-            return std::clamp(sample, -32768, 32767);
-        }
-
         const std::array<std::array<int16_t, 4>, 256> &interpolationWeights()
         {
             static const auto weights = []
@@ -148,52 +142,19 @@ namespace ps2x::iop::detail
         // two blocks early), 0 (when it starts playing: one block late). Read early or late, the decoder's write and
         // the read could fall into a phase where the right half of each block mixed old and new samples (a hiss on the
         // right channel), or the right channel came from another moment (FMV speech heard on the right, then left).
-        enum class AdmaRead
+        audio::StereoPcmStream::Capture admaReadMode()
         {
-            Late,
-            All,
-            Ahead
-        };
-
-        AdmaRead admaReadMode()
-        {
-            static const AdmaRead mode = []
+            using Capture = audio::StereoPcmStream::Capture;
+            static const Capture mode = []
             {
                 const char *v = std::getenv("PS2X_ADMA_COPY");
                 if (v && *v == '0')
-                    return AdmaRead::Late;
+                    return Capture::OnRead;
                 if (v && (std::strcmp(v, "all") == 0 || std::strcmp(v, "1") == 0))
-                    return AdmaRead::All;
-                return AdmaRead::Ahead;
+                    return Capture::OnStart;
+                return Capture::Ahead;
             }();
             return mode;
-        }
-
-        struct StagedAdmaBlock
-        {
-            const uint8_t *source = nullptr;
-            size_t position = 0u;
-            bool valid = false;
-            std::array<uint8_t, 0x400> data{};
-        };
-        std::array<StagedAdmaBlock, 2> g_stagedAdma;
-
-        void stageAdmaBlock(uint32_t core, const uint8_t *source, size_t position)
-        {
-            StagedAdmaBlock &staged = g_stagedAdma[core & 1u];
-            std::memcpy(staged.data.data(), source + position, staged.data.size());
-            staged.source = source;
-            staged.position = position;
-            staged.valid = true;
-        }
-
-        const uint8_t *stagedAdmaBlock(uint32_t core, const uint8_t *source, size_t position)
-        {
-            StagedAdmaBlock &staged = g_stagedAdma[core & 1u];
-            if (!staged.valid || staged.source != source || staged.position != position)
-                return nullptr;
-            staged.valid = false;
-            return staged.data.data();
         }
     }
 
@@ -381,7 +342,7 @@ namespace ps2x::iop::detail
     void IopSpu2::admaStart(uint32_t core, const uint8_t *source, size_t bytes, uint64_t cycle)
     {
         advanceTo(cycle);
-        Adma &adma = m_adma[core & 1u];
+        auto &adma = m_adma[core & 1u];
         ++g_statAdma;
         static uint32_t logLeft = []
         {
@@ -392,32 +353,17 @@ namespace ps2x::iop::detail
         {
             --logLeft;
             std::fprintf(stderr, "[spu2] ADMA core %u start %zu bytes (left in previous: %zu) cycle %llu\n", core & 1u, bytes,
-                         adma.bytes > adma.position ? adma.bytes - adma.position : 0u, static_cast<unsigned long long>(cycle));
+                         adma.pendingBytes(), static_cast<unsigned long long>(cycle));
         }
-        adma.source = source;
-        adma.bytes = bytes & ~static_cast<size_t>(0x3FFu);
-        adma.position = 0u;
-        const AdmaRead mode = admaReadMode();
-        if (mode == AdmaRead::All && source && adma.bytes != 0u)
-        {
-            static std::array<std::vector<uint8_t>, kCores> copies;
-            std::vector<uint8_t> &buffer = copies[core & 1u];
-            buffer.assign(source, source + adma.bytes);
-            adma.source = buffer.data();
-        }
-        else if (mode == AdmaRead::Ahead && source && adma.bytes != 0u)
-        {
-            stageAdmaBlock(core & 1u, source, 0u); // the SPU2 has a free half: the first block moves now
-        }
-        // Keep playing the current block; the new transfer continues where it ends (no gap at buffer swaps).
+        adma.start(source ? std::span<const uint8_t>(source, bytes) : std::span<const uint8_t>{}, admaReadMode());
     }
 
     std::array<int32_t, 2> IopSpu2::admaSample(uint32_t core)
     {
-        Adma &adma = m_adma[core];
-        if (adma.index >= 256u)
+        auto &adma = m_adma[core];
+        if (adma.needsBlock())
         {
-            if (!adma.source || adma.position + 0x400u > adma.bytes)
+            if (!adma.hasBlock())
             {
                 // The next block is late (in the FMVs, by about one sample every 5120: the CRI feed and this clock
                 // drift apart slightly). A zero here was a click in the middle of the sound (-2208, 0, -2255); the
@@ -426,8 +372,8 @@ namespace ps2x::iop::detail
                 static const bool hold = [] { const char *v = std::getenv("PS2X_ADMA_HOLD"); return !(v && *v == '0'); }();
                 if (autoDma(core))
                     ++g_admaLateRun[core & 1u];
-                if (hold && adma.source)
-                    return {adma.left[255], adma.right[255]};
+                if (hold && adma.hasSource())
+                    return adma.last();
                 return {0, 0};
             }
             // God Hand 2026-10-19 (user: music "cut out or crackled" in stage 3, no host-side gap): log streamed
@@ -443,12 +389,8 @@ namespace ps2x::iop::detail
                                  core, late, static_cast<double>(late) / 48.0, static_cast<double>(m_cycle) / (768.0 * 48000.0));
                 }
             }
-            const uint8_t *block = adma.source + adma.position;
-            if (const uint8_t *staged = stagedAdmaBlock(core, adma.source, adma.position))
-                block = staged;
-            std::memcpy(adma.left.data(), block, 0x200u);
-            std::memcpy(adma.right.data(), block + 0x200u, 0x200u);
-            reportAdmaBlock(core & 1u, adma.left.data(), adma.right.data());
+            adma.loadBlock();
+            reportAdmaBlock(core & 1u, adma.left().data(), adma.right().data());
             // PS2X_ADMA_DUMP=<file>: every ADMA block as it is played, s16le stereo per core (core in the low bit of
             // a 4-byte header per block: 'A', core, 0, 0, then 256 left/right sample pairs).
             static std::FILE *admaDump = []() -> std::FILE *
@@ -462,19 +404,12 @@ namespace ps2x::iop::detail
                 std::fwrite(header, 1u, sizeof(header), admaDump);
                 for (uint32_t i = 0; i < 256u; ++i)
                 {
-                    const int16_t pair[2] = {adma.left[i], adma.right[i]};
+                    const int16_t pair[2] = {adma.left()[i], adma.right()[i]};
                     std::fwrite(pair, sizeof(int16_t), 2u, admaDump);
                 }
             }
-            adma.position += 0x400u;
-            adma.index = 0u;
-            // This block starts playing and frees the other half of the SPU2's ADMA buffer: the hardware DMA moves the
-            // next block of the transfer into it now, one block (256 samples) ahead of playing it.
-            if (admaReadMode() == AdmaRead::Ahead && adma.position + 0x400u <= adma.bytes)
-                stageAdmaBlock(core, adma.source, adma.position);
         }
-        const uint32_t i = adma.index++;
-        return {adma.left[i], adma.right[i]};
+        return adma.read();
     }
 
     void IopSpu2::dmaWrite(uint32_t core, const uint8_t *source, size_t bytes, uint64_t cycle)
@@ -686,25 +621,19 @@ namespace ps2x::iop::detail
         // input (ADMA) dry, 0x20/0x10 its wet, 0x08/0x04 external input dry (core 1: the output of core 0), 0x02/0x01
         // its wet. AVOL scales the external input, BVOL the ADMA input, EVOL the reverb output.
         const std::array<int32_t, 2> input = admaSample(core);
-        std::array<int32_t, 2> dry{};
+        std::array<audio::ChannelMix, 2> buses{};
         std::array<int32_t, 2> wet{};
         for (uint32_t channel = 0u; channel < 2u; ++channel)
         {
             const int32_t adma = scale(input[channel], static_cast<int16_t>(reg(shared + 0x0Cu + channel * 2u)));
             const int32_t ext = scale(external[channel], static_cast<int16_t>(reg(shared + 8u + channel * 2u)));
-            if (mixer & (0x800u >> channel))
-                dry[channel] += saturate(output[channel]);
-            if (mixer & (0x80u >> channel))
-                dry[channel] += adma;
-            if (mixer & (0x08u >> channel))
-                dry[channel] += ext;
-            if (mixer & (0x200u >> channel))
-                wet[channel] += saturate(voiceWet[channel]);
-            if (mixer & (0x20u >> channel))
-                wet[channel] += adma;
-            if (mixer & (0x02u >> channel))
-                wet[channel] += ext;
-            wet[channel] = saturate(wet[channel]);
+            // Translate the register once at the boundary to the PCM mixer.
+            const uint16_t route = static_cast<uint16_t>(mixer << channel);
+            auto &bus = buses[channel];
+            bus.add(saturate(output[channel]), saturate(voiceWet[channel]), {(route & 0x800u) != 0u, (route & 0x200u) != 0u});
+            bus.add(adma, adma, {(route & 0x80u) != 0u, (route & 0x20u) != 0u});
+            bus.add(ext, ext, {(route & 0x08u) != 0u, (route & 0x02u) != 0u});
+            wet[channel] = saturate(bus.wet);
         }
         static const bool reverbEnabled = [] { const char *v = std::getenv("PS2X_SPU2_REVERB"); return !v || *v != '0'; }();
         const std::array<int32_t, 2> reverb = reverbEnabled ? reverbFrame(core, wet) : std::array<int32_t, 2>{};
@@ -712,10 +641,9 @@ namespace ps2x::iop::detail
             ++g_statReverbNonZero;
         for (uint32_t channel = 0u; channel < 2u; ++channel)
         {
-            const int32_t mixed =
-                saturate(dry[channel]) + scale(reverb[channel], static_cast<int16_t>(reg(shared + 4u + channel * 2u)));
             const int32_t master = volume(reg(shared + channel * 2u));
-            output[channel] = scale(saturate(mixed), master);
+            const int32_t effectGain = static_cast<int16_t>(reg(shared + 4u + channel * 2u));
+            output[channel] = buses[channel].finish(reverb[channel], effectGain, master);
         }
         // ATTR bit 14 ("mute"). God Hand 2026-10-18: the whole mix went digitally silent for 8-10 ms about every 0.4 s
         // in stage 2 fights and the God Reel menu (logs/audio_out_last.pcm, the user's "sound cuts out"). Exact zero
@@ -748,113 +676,39 @@ namespace ps2x::iop::detail
     // 48 kHz with the same filter. ATTR bit 7 enables the work-area writes. PS2X_SPU2_REVERB=0 disables it.
     std::array<int32_t, 2> IopSpu2::reverbFrame(uint32_t core, const std::array<int32_t, 2> &wet)
     {
-        static constexpr std::array<int16_t, 39> kFir = {
-            -1, 0, 2, 0, -10, 0, 35, 0, -103, 0, 266, 0, -616, 0, 1332, 0, -2960, 0, 10246, 16384,
-            10246, 0, -2960, 0, 1332, 0, -616, 0, 266, 0, -103, 0, 35, 0, -10, 0, 2, 0, -1,
-        };
-        constexpr uint32_t kHistMask = 63u;
-        Reverb &rv = m_reverb[core];
-        const uint32_t pos = static_cast<uint32_t>(rv.frame++ & kHistMask);
-        rv.in[0][pos] = static_cast<int16_t>(wet[0]);
-        rv.in[1][pos] = static_cast<int16_t>(wet[1]);
-
-        // Half-band filter: only the even taps and the centre are non-zero, and it is symmetric.
-        auto firEven = [&](const std::array<int16_t, 64> &h) -> int32_t
-        {
-            int32_t acc = 0;
-            for (uint32_t k = 0u; k < 19u; k += 2u)
-                acc += kFir[k] * (static_cast<int32_t>(h[(pos - k) & kHistMask]) + h[(pos - 38u + k) & kHistMask]);
-            return acc;
-        };
-
-        std::array<int32_t, 2> out{};
-        if ((pos & 1u) == 0u)
-        {
-            // Even frame: the zero-stuffed output only meets the centre tap: (0x4000 * x) >> 14 = x.
-            rv.out[0][pos] = 0;
-            rv.out[1][pos] = 0;
-            out[0] = rv.out[0][(pos - 19u) & kHistMask];
-            out[1] = rv.out[1][(pos - 19u) & kHistMask];
-            return out;
-        }
-
-        std::array<int32_t, 2> in{};
-        for (uint32_t ch = 0u; ch < 2u; ++ch)
-            in[ch] = saturate((firEven(rv.in[ch]) + 0x4000 * rv.in[ch][(pos - 19u) & kHistMask]) >> 15);
-
-        const uint32_t base = core * kCoreStride;
-        auto pair = [&](uint32_t offset) -> uint32_t
-        { return ((static_cast<uint32_t>(reg(base + offset)) & 0xFu) << 16u) | reg(base + offset + 2u); };
-        const uint32_t esa = pair(0x2E0u);
-        const uint32_t end = ((static_cast<uint32_t>(reg(base + 0x33Cu)) & 0xFu) << 16u) | 0xFFFFu;
-        std::array<int32_t, 2> step{};
-        if (esa <= end)
-        {
-            const uint32_t size = end - esa + 1u;
-            if (rv.current < esa || rv.current > end)
-                rv.current = esa;
-            const uint32_t rel = rv.current - esa;
-            const bool write = (reg(base + 0x19Au) & 0x80u) != 0u;
-            const uint32_t shared = kSharedBase + core * 0x28u;
-            auto vol = [&](uint32_t offset) -> int32_t { return static_cast<int16_t>(reg(shared + offset)); };
-            const int32_t vIIR = vol(0x14u), vC1 = vol(0x16u), vC2 = vol(0x18u), vC3 = vol(0x1Au), vC4 = vol(0x1Cu);
-            const int32_t vWALL = vol(0x1Eu), vAPF1 = vol(0x20u), vAPF2 = vol(0x22u);
-            const std::array<int32_t, 2> vIN = {vol(0x24u), vol(0x26u)};
-            // Address registers (halfword units) of the 0x2E4 block, in order: APF1 size, APF2 size, SAME L/R dst,
-            // COMB1 L/R, COMB2 L/R, SAME L/R src, DIFF L/R dst, COMB3 L/R, COMB4 L/R, DIFF L/R src, APF1 L/R dst,
-            // APF2 L/R dst.
-            auto areg = [&](uint32_t index) -> int64_t { return static_cast<int64_t>(pair(0x2E4u + 4u * index)); };
-            auto addr = [&](int64_t offset) -> uint32_t
-            {
-                int64_t a = (static_cast<int64_t>(rel) + offset) % static_cast<int64_t>(size);
-                if (a < 0)
-                    a += size;
-                return (esa + static_cast<uint32_t>(a)) & kAddressMask;
+        return m_reverb[core].process(wet, [&] {
+            audio::ReverbWork work{};
+            const uint32_t base = core * kCoreStride;
+            auto pair = [&](uint32_t offset) -> uint32_t {
+                return ((static_cast<uint32_t>(reg(base + offset)) & 0xFu) << 16u) | reg(base + offset + 2u);
             };
-            auto rd = [&](int64_t offset) -> int32_t { return static_cast<int16_t>(m_ram[addr(offset)]); };
-            auto wr = [&](int64_t offset, int32_t value) { m_ram[addr(offset)] = static_cast<uint16_t>(saturate(value)); };
-            const int64_t apf1Size = areg(0), apf2Size = areg(1);
-            if (write)
+            work.start = pair(0x2E0u);
+            const uint32_t end = ((static_cast<uint32_t>(reg(base + 0x33Cu)) & 0xFu) << 16u) | 0xFFFFu;
+            if (work.start > end)
+                return work;
+            work.delayLine = std::span<uint16_t>(m_ram).subspan(work.start, end - work.start + 1u);
+            work.write = (reg(base + 0x19Au) & 0x80u) != 0u;
+
+            const uint32_t shared = kSharedBase + core * 0x28u;
+            auto gain = [&](uint32_t offset) -> int32_t { return static_cast<int16_t>(reg(shared + offset)); };
+            auto tap = [&](uint32_t index) -> int32_t { return static_cast<int32_t>(pair(0x2E4u + 4u * index)); };
+            work.iirGain = gain(0x14u);
+            work.wallGain = gain(0x1Eu);
+            work.combGains = {gain(0x16u), gain(0x18u), gain(0x1Au), gain(0x1Cu)};
+            work.allPassGains = {gain(0x20u), gain(0x22u)};
+            work.allPassDelays = {tap(0u), tap(1u)};
+            for (uint32_t channel = 0u; channel < 2u; ++channel)
             {
-                for (uint32_t ch = 0u; ch < 2u; ++ch)
-                {
-                    const int32_t input = scale(vIN[ch], in[ch]);
-                    const int64_t sameDst = areg(2u + ch), sameSrc = areg(8u + ch);
-                    int32_t prev = rd(sameDst - 1);
-                    int32_t t = saturate(input + scale(rd(sameSrc), vWALL) - prev);
-                    wr(sameDst, scale(t, vIIR) + prev);
-                    const int64_t diffDst = areg(10u + ch), diffSrc = areg(ch ? 16u : 17u); // sources are crossed
-                    prev = rd(diffDst - 1);
-                    t = saturate(input + scale(rd(diffSrc), vWALL) - prev);
-                    wr(diffDst, scale(t, vIIR) + prev);
-                }
+                work.channels[channel] = {
+                    gain(0x24u + channel * 2u),
+                    tap(2u + channel), tap(8u + channel),
+                    tap(10u + channel), tap(17u - channel),
+                    {tap(4u + channel), tap(6u + channel), tap(12u + channel), tap(14u + channel)},
+                    {tap(18u + channel), tap(20u + channel)},
+                };
             }
-            for (uint32_t ch = 0u; ch < 2u; ++ch)
-            {
-                int32_t o = scale(vC1, rd(areg(4u + ch))) + scale(vC2, rd(areg(6u + ch))) + scale(vC3, rd(areg(12u + ch))) +
-                            scale(vC4, rd(areg(14u + ch)));
-                o = saturate(o);
-                const int64_t apf1Dst = areg(18u + ch);
-                int32_t a = rd(apf1Dst - apf1Size);
-                o = saturate(o - scale(vAPF1, a));
-                if (write)
-                    wr(apf1Dst, o);
-                o = saturate(scale(o, vAPF1) + a);
-                const int64_t apf2Dst = areg(20u + ch);
-                a = rd(apf2Dst - apf2Size);
-                o = saturate(o - scale(vAPF2, a));
-                if (write)
-                    wr(apf2Dst, o);
-                o = saturate(scale(o, vAPF2) + a);
-                step[ch] = o;
-            }
-            rv.current = rv.current + 1u > end ? esa : rv.current + 1u;
-        }
-        rv.out[0][pos] = static_cast<int16_t>(step[0]);
-        rv.out[1][pos] = static_cast<int16_t>(step[1]);
-        for (uint32_t ch = 0u; ch < 2u; ++ch)
-            out[ch] = saturate(firEven(rv.out[ch]) >> 14);
-        return out;
+            return work;
+        });
     }
 
     void IopSpu2::keyOn(uint32_t core, uint32_t index)
@@ -910,9 +764,7 @@ namespace ps2x::iop::detail
         const int32_t fraction = voice.counter + kPitchStep;
         const auto &weights = interpolationWeights()[std::min(fraction >> 4, 255)];
         const auto &history = m_interpolation[core][index];
-        int32_t pcm = 0;
-        for (size_t tap = 0u; tap < history.size(); ++tap)
-            pcm += scale(history[tap], weights[tap]);
+        const int32_t pcm = audio::interpolate(history, weights);
         return scale(saturate(pcm), voice.envelope >> 16);
     }
 

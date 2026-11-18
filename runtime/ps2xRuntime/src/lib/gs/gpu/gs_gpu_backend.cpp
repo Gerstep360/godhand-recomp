@@ -9,6 +9,7 @@
 #include "gs_gpu_shaders.h"
 #include "ThreadNaming.h"
 #include "ThreadPriority.h"
+#include "runtime/ps2_host_ui.h"
 
 #include <algorithm>
 #include <atomic>
@@ -275,6 +276,7 @@ struct GSGpuBackend::Impl
     Program orderedShuffle;
     std::string shaderPrefix;
     Program hwRaster;
+    std::atomic<bool> hwCompilerFailed{false};
     GLuint hwFramebuffer = 0;
     GLuint hwVertexArray = 0;
     bool hwEnabled = false;
@@ -836,6 +838,7 @@ struct GSGpuBackend::Impl
         return out;
     }
 
+    uint32_t startupCacheHits=0, startupCompiles=0;
     bool compile(Program &program, const std::string &prefix, const char *body, std::initializer_list<const char *> uniforms)
     {
         const std::string source = prefix + shaderText(GSGpuShaders::kCommon) + shaderText(body);
@@ -890,6 +893,7 @@ struct GSGpuBackend::Impl
                     if (linked)
                     {
                         bindUniforms();
+                        ++startupCacheHits;
                         std::fprintf(stderr, "[gs-gpu] shader binary cache hit %s\n", cachePath.filename().string().c_str());
                         return true;
                     }
@@ -898,6 +902,7 @@ struct GSGpuBackend::Impl
                 }
             }
         }
+        ++startupCompiles;
         const char *text = source.c_str();
         const GLuint shader = gl().CreateShader(kComputeShader);
         gl().ShaderSource(shader, 1, &text, nullptr);
@@ -950,12 +955,17 @@ struct GSGpuBackend::Impl
                     const uint64_t checksum = fingerprint(binary.data(), static_cast<size_t>(written));
                     std::error_code error;
                     std::filesystem::create_directories(cachePath.parent_path(), error);
-                    std::ofstream output(cachePath, std::ios::binary | std::ios::trunc);
+                    const auto temporary=std::filesystem::path(cachePath.string()+".tmp");
+                    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
                     output.write(reinterpret_cast<const char *>(header.data()), sizeof(header));
                     output.write(reinterpret_cast<const char *>(&checksum), sizeof(checksum));
                     output.write(driver.data(), driver.size());
                     output.write(source.data(), source.size());
                     output.write(reinterpret_cast<const char *>(binary.data()), written);
+                    output.flush();
+                    const bool saved=bool(output); output.close();
+                    if(!saved || !GSGL::replaceCacheFile(temporary,cachePath))
+                        std::fprintf(stderr,"[gs-cache] could not persist %s; rendering continues\n",cachePath.filename().string().c_str());
                 }
             }
         }
@@ -1079,8 +1089,11 @@ struct GSGpuBackend::Impl
             output.write(reinterpret_cast<const char *>(&checksum), sizeof(checksum));
             output.write(key.data(), key.size());
             output.write(reinterpret_cast<const char *>(binary.data()), binary.size());
+            output.flush();
+            if(!output) {std::fprintf(stderr,"[gs-cache] failed writing shader binary; previous cache preserved\n");return;}
         }
-        std::filesystem::rename(temporary, path, error);
+        if(!GSGL::replaceCacheFile(temporary,path))
+            std::fprintf(stderr,"[gs-cache] could not replace %s; rendering continues\n",path.filename().string().c_str());
     }
 
     std::string hardwareFragmentSource(const HwKey &key) const
@@ -1098,6 +1111,48 @@ struct GSGpuBackend::Impl
         program.id = id;
         program.loc[0] = gl().GetUniformLocation(id, "uRaster");
         program.loc[1] = gl().GetUniformLocation(id, "uHw");
+    }
+
+    void setupHardwareFallback()
+    {
+        const char *setting = std::getenv("PS2X_GS_HW_FALLBACK");
+        if (setting && *setting == '0')
+            return;
+        // The same raster shader with dynamic GS state. A previously unseen effect must not force the entire
+        // batch through the much slower tile/compute rasterizer while its specialized shader compiles.
+        // Compile once before gameplay; the source/driver-keyed binary cache also covers this program.
+        const std::string fragment = hwFragmentHead + "#define HW_TYPE(h) ((h) & 0xFFu)\n" + hwFragmentBody;
+        const std::string key = std::string(reinterpret_cast<const char *>(gl().GetString(kRenderer))) + "\n" +
+                                reinterpret_cast<const char *>(gl().GetString(kVersion)) + "\n" + hwVertexSource + "\n" + fragment;
+        const auto path = hardwareCachePath(key);
+        if (const GLuint cached = loadHardwareBinary(path, key))
+        {
+            finishVariant(hwRaster, cached);
+            std::fprintf(stderr, "[gs-gpu] generic hardware fallback loaded from cache\n");
+            return;
+        }
+        if(!hwVertexShader) hwVertexShader=compileStage(kVertexShader,hwVertexSource);
+        if(!hwVertexShader) return;
+        const GLuint shader = compileStage(kFragmentShader, fragment);
+        if (!shader)
+            return;
+        const GLuint program = gl().CreateProgram();
+        gl().ProgramParameteri(program, kProgramBinaryRetrievableHint, 1);
+        gl().AttachShader(program, hwVertexShader);
+        gl().AttachShader(program, shader);
+        gl().LinkProgram(program);
+        gl().DeleteShader(shader);
+        GLint linked = 0;
+        gl().GetProgramiv(program, kLinkStatus, &linked);
+        if (!linked)
+        {
+            gl().DeleteProgram(program);
+            std::fprintf(stderr, "[gs-gpu] generic hardware fallback unavailable; keeping compute fallback\n");
+            return;
+        }
+        storeHardwareBinary(path, key, program);
+        finishVariant(hwRaster, program);
+        std::fprintf(stderr, "[gs-gpu] generic hardware fallback compiled\n");
     }
 
     void drainCompiledVariants()
@@ -1130,12 +1185,14 @@ struct GSGpuBackend::Impl
     void prewarmHardwareVariants()
     {
         const std::filesystem::path path = hardwareManifestPath();
-        // Off by default (PS2X_GS_HW_PRELOAD=1 turns it on): on NVIDIA each glProgramBinary on the worker context
+        // Mode 1 loads in the background; mode 2 finishes before starting the EE. On NVIDIA each glProgramBinary
         // takes ~15 ms and stalls the renderer's context in the driver, so preloading a 3400-key manifest ran the
         // whole boot and menus at 40-80% speed for ~2 minutes. On-demand loading of cached binaries keeps 100%.
         const char *preload = std::getenv("PS2X_GS_HW_PRELOAD");
-        if (path.empty() || !preload || *preload != '1')
+        if (path.empty() || !preload || (*preload != '1' && *preload != '2')) {
+            std::fprintf(stderr,"[gs-cache] fast startup: load cached variants on demand; no full prewarm\n");
             return;
+        }
         std::ifstream input(path);
         std::string line;
         size_t queued = 0u;
@@ -1153,6 +1210,24 @@ struct GSGpuBackend::Impl
         }
         if (queued)
             std::fprintf(stderr, "[gs-gpu] preloading %zu hardware raster shaders\n", queued);
+        if (*preload == '2' && queued)
+        {
+            // ProgramBinary/driver compilation can serialize GL contexts even on the worker. Pay for known states
+            // once at startup rather than interrupting a cinematic or power effect when it first uses them.
+            const auto started = std::chrono::steady_clock::now();
+            ps2x::hostui::shaderProgress(0, static_cast<uint32_t>(queued));
+            while (hwVariants.size() < queued && !ps2x::hostui::closing() && !hwCompilerFailed.load(std::memory_order_relaxed))
+            {
+                drainCompiledVariants();
+                ps2x::hostui::shaderProgress(static_cast<uint32_t>(hwVariants.size()), static_cast<uint32_t>(queued));
+                if (hwVariants.size() < queued)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            std::fprintf(stderr, "[gs-gpu] %zu/%zu hardware shaders ready before gameplay (%.0f ms)%s\n",
+                         hwVariants.size(), queued,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(),
+                         hwVariants.size() == queued ? "" : "; remaining shaders continue in the background");
+        }
     }
 
     void rememberVariant(const HwKey &key)
@@ -1216,8 +1291,18 @@ struct GSGpuBackend::Impl
 
     void compileWorker()
     {
+        // A fast boot has no queued variants. Do not bind a second GL context and
+        // wake the driver's compiler until a shader is actually requested.
+        {
+            std::unique_lock<std::mutex> lock(hwCompileMutex);
+            hwCompileCv.wait(lock,[&]{return hwCompileStop || !hwJobs.empty();});
+            if(hwCompileStop) return;
+        }
         if (!context.MakeWorkerCurrent(hwWorkerContext))
+        {
+            hwCompilerFailed.store(true, std::memory_order_relaxed);
             return;
+        }
         ThreadNaming::SetCurrentThreadName("GSShaderCompiler");
 #if defined(_WIN32)
         SetThreadPriority(GetCurrentThread(), -1);
@@ -1228,7 +1313,10 @@ struct GSGpuBackend::Impl
         const uint32_t compileThreads = threadsValue ? static_cast<uint32_t>(std::clamp(std::atoi(threadsValue), 1, 32)) : 2u;
         if (gl().MaxShaderCompilerThreads)
             gl().MaxShaderCompilerThreads(compileThreads);
-        const GLuint vertex = compileStage(kVertexShader, hwVertexSource);
+        // Immutable shader objects are shared with this worker's context. The
+        // renderer retains ownership until after stopCompiler() joins this thread.
+        GLuint vertex = hwVertexShader;
+        bool ownsVertex=false;
         struct InFlight
         {
             CompileJob job;
@@ -1267,6 +1355,10 @@ struct GSGpuBackend::Impl
                     loaded.push_back({job.key, cached, true, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count()});
                     continue;
                 }
+                // Program binaries already include their vertex stage. Compile a
+                // vertex shader only for a genuinely new/missing fragment variant.
+                if(!vertex) {vertex=compileStage(kVertexShader,hwVertexSource);ownsVertex=true;}
+                if(!vertex) {done.push_back({job.key,0,false,0.0});continue;}
                 InFlight item;
                 item.started = started;
                 const char *text = job.fragment.c_str();
@@ -1331,8 +1423,7 @@ struct GSGpuBackend::Impl
             gl().DeleteShader(item.fragment);
             gl().DeleteProgram(item.program);
         }
-        if (vertex)
-            gl().DeleteShader(vertex);
+        if(ownsVertex && vertex) gl().DeleteShader(vertex);
         gl().Finish();
     }
 
@@ -1458,9 +1549,7 @@ struct GSGpuBackend::Impl
         if (gl().MaxShaderCompilerThreads)
             gl().MaxShaderCompilerThreads(0xFFFFFFFFu);
         hwVertexSource = version + GSGpuShaders::kHwVertex;
-        hwVertexShader = compileStage(kVertexShader, hwVertexSource);
-        if (!hwVertexShader)
-            return false;
+        setupHardwareFallback();
         hwWorkerContext = context.CreateWorker();
         if (!hwWorkerContext)
             return false;
@@ -1484,6 +1573,7 @@ struct GSGpuBackend::Impl
             return true;
         if (failed)
             return false;
+        const auto initializedAt=std::chrono::steady_clock::now();
         std::string error;
         if (!context.Create(error))
         {
@@ -1589,6 +1679,7 @@ struct GSGpuBackend::Impl
                 std::fprintf(stderr, "[gs-present] image store unavailable; shared texture filled through an unpack buffer\n");
             }
         }
+        std::fprintf(stderr,"[gs-cache] startup: %u binaries reused, %u compute shaders compiled; %.0f ms. Variants remain cached on disk.\n",startupCacheHits,startupCompiles,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-initializedAt).count());
         initialized = true;
         if (hostVram)
             uploadHostVram();
@@ -1881,6 +1972,8 @@ struct GSGpuBackend::Impl
                 }
                 const auto variantStart = std::chrono::steady_clock::now();
                 const Program *program = hardwareVariant(runKey);
+                if (!program && hwRaster.id)
+                    program = &hwRaster;
                 hwVariantMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - variantStart).count();
                 ready = ready && program != nullptr;
                 hwRuns.push_back({program, runStart, prim});

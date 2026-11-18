@@ -24,16 +24,28 @@ namespace
     bool g_open = false;
     WindowInfo g_window;
 
-    // Urban Reign's entry in PCSX2's GameIndex.yaml (SLUS-21209): alignSprite 1, textureInsideRT 1,
-    // halfPixelOffset 4, nativeScaling 2, getSkipCount GSC_UrbanReign. PCSX2 applies them through its game database;
-    // here they are fixed.
+    bool RequestDirect3D12()
+    {
+        const char *value = std::getenv("PS2X_PCSX2_DEVICE");
+        if (!value || std::string_view(value) != "dx12")
+            return false;
+
+        // DX12 uses a delay-loaded shader compiler. Probe before switching
+        // devices so an installation without DXC can still start normally.
+        constexpr DWORD search = LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32;
+        static const HMODULE compiler = LoadLibraryExW(L"dxcompiler.dll", nullptr, search);
+        static const HMODULE validator = LoadLibraryExW(L"dxil.dll", nullptr, search);
+        if (compiler && validator && GetProcAddress(compiler, "DxcCreateInstance"))
+            return true;
+        std::fprintf(stderr, "[pcsx2-gs] DX12 needs dxcompiler.dll and dxil.dll; using DX11\n");
+        return false;
+    }
+
+    // Apply the SLUS-21503 hardware fixes from the vendored PCSX2 revision's GameIndex.
     void ApplyGameFixes(Pcsx2Config::GSOptions &options)
     {
-        options.UserHacks_AlignSpriteX = true;
-        options.UserHacks_TextureInsideRt = GSTextureInRtMode::InsideTargets;
-        options.UserHacks_HalfPixelOffset = GSHalfPixelOffset::Native;
+        options.UserHacks_HalfPixelOffset = GSHalfPixelOffset::Special;
         options.UserHacks_NativeScaling = GSNativeScaling::Aggressive;
-        options.GetSkipCountFunctionId = GSLookupGetSkipCountFunctionId("GSC_UrbanReign");
     }
 
     // Pcsx2GsOpenParams::options: "key=value;key=value".
@@ -110,7 +122,7 @@ namespace
         pcsx2gs::SetFolders(params->resources ? params->resources : "", params->cache ? params->cache : "");
 
         Pcsx2Config::GSOptions options;
-        options.Renderer = GSRendererType::DX11;
+        options.Renderer = RequestDirect3D12() ? GSRendererType::DX12 : GSRendererType::DX11;
         options.UpscaleMultiplier = std::max(1.0f, params->scale);
         options.AspectRatio = params->stretch ? AspectRatioType::Stretch : AspectRatioType::R4_3;
         ApplyGameFixes(options);
@@ -123,15 +135,21 @@ namespace
         const GSVSyncMode vsync = params->vsync == 1u ? GSVSyncMode::FIFO
                                   : params->vsync == 2u ? GSVSyncMode::Mailbox
                                                         : GSVSyncMode::Disabled;
-        if (!GSopen(options, GSRendererType::DX11, g_regs, vsync, false))
+        if (!GSopen(options, options.Renderer, g_regs, vsync, false))
         {
-            std::fprintf(stderr, "[pcsx2-gs] GSopen failed\n");
-            return 0;
+            if (options.Renderer != GSRendererType::DX12)
+                return 0;
+            std::fprintf(stderr, "[pcsx2-gs] DX12 device could not open; using DX11\n");
+            options.Renderer = GSRendererType::DX11;
+            EmuConfig.GS = options;
+            if (!GSopen(options, options.Renderer, g_regs, vsync, false))
+                return 0;
         }
         g_open = true;
         int w = 0, h = 0;
         GSgetInternalResolution(&w, &h);
-        std::fprintf(stderr, "[pcsx2-gs] DX11, scale %.0f (%dx%d), window %ux%u, options: %s\n", options.UpscaleMultiplier, w, h,
+        std::fprintf(stderr, "[pcsx2-gs] %s, scale %.0f (%dx%d), window %ux%u, options: %s\n",
+                     options.Renderer == GSRendererType::DX12 ? "DX12" : "DX11", options.UpscaleMultiplier, w, h,
                      g_window.surface_width, g_window.surface_height, params->options ? params->options : "");
         return 1;
     }
@@ -163,7 +181,7 @@ namespace
                 std::fputs("qpc,last_present,shown_present,shown_refresh,sync_refresh,sync_qpc\n", f);
             return f;
         }();
-        GSDevice11 *device = file ? GSDevice11::GetInstance() : nullptr;
+        GSDevice11 *device = file && GSGetCurrentRenderer() == GSRendererType::DX11 ? GSDevice11::GetInstance() : nullptr;
         IDXGISwapChain1 *swapChain = device ? device->GetSwapChain() : nullptr;
         if (!swapChain)
             return;
@@ -305,6 +323,22 @@ namespace
 extern "C" __declspec(dllexport) const Pcsx2GsApi *pcsx2gs_get_api(uint32_t version)
 {
     return version == PCSX2GS_API_VERSION ? &g_api : nullptr;
+}
+
+// Called on the GS thread. The pixels are valid only during the callback.
+extern "C" __declspec(dllexport) void pcsx2gs_capture(void (*receive)(uint32_t, uint32_t, const uint32_t *))
+{
+    u32 width = 0, height = 0;
+    std::vector<u32> pixels;
+    if (g_open && receive && GSSaveSnapshotToMemory(640, 480, true, false, &width, &height, &pixels) && width && height)
+        receive(width, height, pixels.data());
+}
+
+extern "C" __declspec(dllexport) void pcsx2gs_set_vsync(uint32_t mode)
+{
+    if (g_open)
+        GSSetVSyncMode(mode == 1u ? GSVSyncMode::FIFO :
+                       mode == 2u ? GSVSyncMode::Mailbox : GSVSyncMode::Disabled, false);
 }
 
 // The aspect ratio while the game runs (0 = 4:3, 1 = 16:9, 2 = fill the window), read at every present: the port uses

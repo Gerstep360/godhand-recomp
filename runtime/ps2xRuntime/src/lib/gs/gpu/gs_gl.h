@@ -3,9 +3,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <filesystem>
 
 namespace GSGL
 {
+    bool replaceCacheFile(const std::filesystem::path &temporary,const std::filesystem::path &destination);
     using GLenum = unsigned int;
     using GLuint = unsigned int;
     using GLint = int;

@@ -513,7 +513,9 @@ namespace
     VU1InterpreterAccess::CompiledProgram lookupCompiledVu1Program(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory)
     {
         Vu1CompiledRegistry &registry = vu1CompiledRegistry();
-        if (!registry.enabled || registry.programs.empty() || !memory)
+        // An empty registry still needs the generation cache and miss reporting. Otherwise a fresh build silently
+        // interprets all 3D code and never writes the images needed to enable AOT. Check only when code changes.
+        if (!registry.enabled || !memory)
             return nullptr;
         const uint64_t generation = memory->getVU1CodeGeneration();
         if (registry.memory != memory || registry.code != vuCode || registry.generation != generation)

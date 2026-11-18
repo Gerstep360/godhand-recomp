@@ -50,4 +50,6 @@ namespace godhand
     // Mounts the image (PS2CdImage singleton), checks SYSTEM.CNF, the disc files above and the boot ELF's SHA-256, and
     // writes the boot ELF to cacheDir/SLUS_215.03 for PS2Runtime::loadELF.
     DiscCheckResult verifyDiscAndPrepare(const std::filesystem::path &image, const std::filesystem::path &cacheDir);
+    DiscCheckResult openInstalledData(const std::filesystem::path &directory);
+    DiscCheckResult installGameData(const std::filesystem::path &image, const std::filesystem::path &directory);
 }

@@ -136,6 +136,10 @@ namespace ps2x::controls
         std::array<Clock::time_point, 4> g_navRepeat{};
 
         Font g_font{};
+        const Font *g_portFont = nullptr;
+        bool g_requestedOpen = false;
+        bool g_native = false;
+        bool g_nativePageInput = true;
         int g_fontSize = 0;
         bool g_fontOwned = false;
 
@@ -794,6 +798,14 @@ namespace ps2x::controls
         // ---- drawing ----------------------------------------------------------------------------------------------------
         void ensureFont(int size)
         {
+            if (g_portFont && g_portFont->texture.id)
+            {
+                if (g_fontOwned) UnloadFont(g_font);
+                g_fontOwned = false;
+                g_font = *g_portFont;
+                g_fontSize = size;
+                return;
+            }
             if (size == g_fontSize && g_font.texture.id != 0)
                 return;
             if (g_fontOwned)
@@ -902,14 +914,39 @@ namespace ps2x::controls
         return g_open;
     }
 
+    void requestOpen() { g_requestedOpen = true; }
+    void setNativePresentation(bool enabled) { g_native = enabled; }
+    void setNativePageInput(bool enabled) { g_nativePageInput = enabled; }
+    void saveAndClose() { if (g_open) close(true); }
+    NativeView nativeView()
+    {
+        NativeView v; v.row = g_row; v.column = g_col; v.capturing = g_capture; v.status = g_status;
+        for (int row = 0; row < kRowCount; ++row)
+        {
+            const auto split = splitRow(row);
+            std::array<std::string, 5> cells; cells[0] = kRows[row].button;
+            for (int c = 0; c < 3; ++c) cells[c + 1] = c < int(split.keys.size()) ? pc::displayName(split.keys[c]) : "-";
+            cells[4] = split.pads.empty() ? "-" : pc::displayName(split.pads.front());
+            v.rows.push_back(std::move(cells));
+        }
+        return v;
+    }
+    void setFont(const Font *font) { g_portFont = font; }
+
     void hostTick(bool drawable)
     {
+        if (g_requestedOpen)
+        {
+            g_requestedOpen = false;
+            open(drawable, false);
+            return;
+        }
         const bool focused = IsWindowFocused();
         // Sweep CR-5: the Back+Start gate in ps2_host_input holds a controller's Back/Start back from the game for a
         // moment, so a chord started with Start does not pause the game behind this screen. Only while Back+Start can
         // open it (drawn by this renderer, window focused: snapshotPads ignores controllers otherwise), so Start has no
         // delay when the chord could do nothing. Runs before ps2_host_input::sample(), which applies it.
-        ps2_host_input::setChordGate(drawable && focused);
+        ps2_host_input::setChordGate(!g_native && drawable && focused);
         const bool lostFocus = g_prevFocused && !focused;
         g_prevFocused = focused;
         const PadSnapshot now = snapshotPads(focused);
@@ -920,10 +957,15 @@ namespace ps2x::controls
         testTick(drawable);
         if (!g_open)
         {
-            if (IsKeyPressed(KEY_F1))
+            if (!g_native && IsKeyPressed(KEY_F1))
                 command(Command::Toggle, drawable, false);
-            else if (chordEdge)
+            else if (!g_native && chordEdge)
                 command(Command::Toggle, drawable, true);
+        }
+        else if (g_native && !g_nativePageInput)
+        {
+            if (IsKeyPressed(KEY_ESCAPE) || buttonEdge(now, ps2_host_gamepads::East))
+                command(Command::Back, drawable, false);
         }
         else if (g_capture)
             captureTick(now);
@@ -952,6 +994,7 @@ namespace ps2x::controls
 
     void draw()
     {
+        if (g_native) return;
         if (!g_open)
         {
             if (g_test.shotPending)

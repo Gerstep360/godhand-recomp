@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_pcsx2_backend.h"
 #include "runtime/gs/gs_aspect.h"
+#include "runtime/ps2_display_options.h"
 
 #include <algorithm>
 #include <atomic>
@@ -9,6 +10,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -31,6 +34,12 @@ namespace
 {
     const Pcsx2GsApi *g_api = nullptr;
     void(__cdecl *g_setAspect)(uint32_t) = nullptr; // pcsx2gs_set_aspect, when the DLL has it
+    void(__cdecl *g_setVsync)(uint32_t) = nullptr;
+    using PreviewCallback = void (*)(uint32_t, uint32_t, const uint32_t *);
+    void (__cdecl *g_capture)(PreviewCallback) = nullptr;
+    std::atomic<bool> g_previewRequested{false};
+    std::mutex g_previewMutex;
+    GSPcsx2Backend::PreviewFrame g_preview;
     const std::chrono::steady_clock::time_point g_processStart = std::chrono::steady_clock::now();
     HWND g_parent = nullptr;
     HWND g_child = nullptr;
@@ -174,13 +183,18 @@ void GSPcsx2Backend::WriteFrameTime(std::chrono::steady_clock::time_point presen
     m_gifBytesAtPresent = m_gifBytes;
 }
 
+bool GSPcsx2Backend::Available()
+{
+    std::error_code ec;
+    return std::filesystem::is_regular_file(exeDirectory() / "pcsx2gs.dll", ec);
+}
+
 bool GSPcsx2Backend::Requested()
 {
     static const bool requested = []
     {
-        // The default since PROGRESS §85; PS2X_GS_RENDERER=nativo (config.ini Renderizador=nativo) keeps the port's GS.
         const char *value = std::getenv("PS2X_GS_RENDERER");
-        std::string name = (value && *value) ? value : "pcsx2";
+        std::string name = (value && *value) ? value : "native";
         std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         if (name != "pcsx2")
             return false;
@@ -195,6 +209,8 @@ bool GSPcsx2Backend::Requested()
         const auto getApi = reinterpret_cast<Pcsx2GsGetApiFn>(GetProcAddress(module, "pcsx2gs_get_api"));
         g_api = getApi ? getApi(PCSX2GS_API_VERSION) : nullptr;
         g_setAspect = reinterpret_cast<void(__cdecl *)(uint32_t)>(GetProcAddress(module, "pcsx2gs_set_aspect"));
+        g_capture = reinterpret_cast<void(__cdecl *)(PreviewCallback)>(GetProcAddress(module, "pcsx2gs_capture"));
+        g_setVsync = reinterpret_cast<void(__cdecl *)(uint32_t)>(GetProcAddress(module, "pcsx2gs_set_vsync"));
         if (!g_api)
         {
             std::fprintf(stderr, "[gs] pcsx2gs.dll has no matching pcsx2gs_get_api (version %u); using the built-in GS\n",
@@ -279,20 +295,31 @@ uint64_t GSPcsx2Backend::Presents()
 
 namespace
 {
-    bool g_hostUiVisible = false;
+    uint8_t g_hostUiOverlays = 0;
 }
 
-void GSPcsx2Backend::SetHostUiVisible(bool visible)
+void GSPcsx2Backend::SetHostUiVisible(HostOverlay overlay, bool visible)
 {
-    if (!g_child || g_hostUiVisible == visible)
+    if (!g_child)
         return;
-    g_hostUiVisible = visible;
-    ShowWindow(g_child, visible ? SW_HIDE : SW_SHOWNA);
+    const bool wasVisible = HostUiVisible();
+    const auto bit = static_cast<uint8_t>(overlay);
+    g_hostUiOverlays = visible ? (g_hostUiOverlays | bit) : (g_hostUiOverlays & ~bit);
+    if (wasVisible != HostUiVisible())
+        ShowWindow(g_child, HostUiVisible() ? SW_HIDE : SW_SHOWNA);
 }
 
 bool GSPcsx2Backend::HostUiVisible()
 {
-    return g_hostUiVisible;
+    return g_hostUiOverlays != 0;
+}
+
+void GSPcsx2Backend::RequestPreview() { g_previewRequested.store(true); }
+
+GSPcsx2Backend::PreviewFrame GSPcsx2Backend::TakePreview()
+{
+    std::lock_guard<std::mutex> lock(g_previewMutex);
+    return std::exchange(g_preview, {});
 }
 
 GSPcsx2Backend::GSPcsx2Backend() = default;
@@ -313,7 +340,7 @@ bool GSPcsx2Backend::EnsureOpen()
         return false;
     const std::filesystem::path dir = exeDirectory();
     const std::string resources = utf8(dir / "resources");
-    const std::filesystem::path cacheDir = dir / "shadercache_pcsx2";
+    const std::filesystem::path cacheDir = dir / "shadercache_pcsx2" / "SLUS-21503";
     std::error_code ec;
     std::filesystem::create_directories(cacheDir, ec);
     const std::string cache = utf8(cacheDir);
@@ -326,7 +353,8 @@ bool GSPcsx2Backend::EnsureOpen()
     params.scale = static_cast<float>(std::clamp(envInt("PS2X_GS_SCALE", 1), 1, 8));
     params.resources = resources.c_str();
     params.cache = cache.c_str();
-    params.vsync = static_cast<uint32_t>(std::clamp(envInt("PS2X_PCSX2_VSYNC", 2), 0, 2)); // mailbox: no tearing, no wait
+    m_vsyncEnabled = ps2_host_display::vsyncEnabled();
+    params.vsync = static_cast<uint32_t>(std::clamp(envInt("PS2X_PCSX2_VSYNC", m_vsyncEnabled ? 2 : 0), 0, 2));
     params.stretch = envInt("PS2X_PCSX2_STRETCH", 0) != 0 ? 1u : 0u;
     // Image options (pcsx2gs_api.h): PS2X_PCSX2_<KEY> -> key=value. FXAA is on unless PS2X_PCSX2_FXAA=0.
     static constexpr struct
@@ -361,22 +389,20 @@ bool GSPcsx2Backend::EnsureOpen()
         if (value)
             options += std::string(option.key) + "=" + value + ";";
     }
-    // HD textures (PS2X_PCSX2_TEXTURES=0 turns them off): PCSX2's replacement packs, from PS2X_PCSX2_TEXTURE_DIR (the
-    // folder holding replacements/) or textures/SLUS-21209 next to urban.exe or up to three folders above it (the
-    // repository's textures/ when urban.exe runs from build/port/bin, as with game/).
+    // PCSX2 texture packs can live next to the executable or at the root of the port.
     if (envInt("PS2X_PCSX2_TEXTURES", 1) != 0)
     {
         const char *textureDir = std::getenv("PS2X_PCSX2_TEXTURE_DIR");
         std::filesystem::path folder = (textureDir && *textureDir) ? std::filesystem::path(textureDir)
-                                                                 : dir / "textures" / "SLUS-21209";
+                                                                 : dir / "textures" / "SLUS-21503";
         if (!(textureDir && *textureDir))
         {
             std::filesystem::path base = dir;
             for (int up = 0; up < 4; ++up, base = base.parent_path())
             {
-                if (std::filesystem::is_directory(base / "textures" / "SLUS-21209" / "replacements", ec))
+                if (std::filesystem::is_directory(base / "textures" / "SLUS-21503" / "replacements", ec))
                 {
-                    folder = base / "textures" / "SLUS-21209";
+                    folder = base / "textures" / "SLUS-21503";
                     break;
                 }
             }
@@ -515,6 +541,12 @@ void GSPcsx2Backend::VSync(const GSVSyncRegs &regs)
 {
     if (!EnsureOpen())
         return;
+    const bool vsyncEnabled = ps2_host_display::vsyncEnabled();
+    if (g_setVsync && vsyncEnabled != m_vsyncEnabled)
+    {
+        m_vsyncEnabled = vsyncEnabled;
+        g_setVsync(vsyncEnabled ? 2u : 0u);
+    }
     const uint32_t width = g_clientWidth.load(std::memory_order_relaxed);
     const uint32_t height = g_clientHeight.load(std::memory_order_relaxed);
     if (width != m_width || height != m_height)
@@ -525,6 +557,15 @@ void GSPcsx2Backend::VSync(const GSVSyncRegs &regs)
     }
     const auto presentStart = std::chrono::steady_clock::now();
     g_api->vsync(reinterpret_cast<const Pcsx2GsPrivRegs *>(&regs));
+    if (g_capture && g_previewRequested.exchange(false))
+        g_capture([](uint32_t width, uint32_t height, const uint32_t *pixels)
+        {
+            PreviewFrame frame{width, height, {pixels, pixels + size_t(width) * height}};
+            for (uint32_t &pixel : frame.rgba)
+                pixel |= 0xff000000u;
+            std::lock_guard<std::mutex> lock(g_previewMutex);
+            g_preview = std::move(frame);
+        });
     WriteFrameTime(presentStart);
     g_presents.fetch_add(1u, std::memory_order_relaxed);
     if (GifDump &dump = gifDump(); !dump.done)
@@ -573,6 +614,7 @@ void ps2x::gs::setAspect(Aspect aspect)
 
 void ps2x::gs::setAspect(Aspect) {}
 
+bool GSPcsx2Backend::Available() { return false; }
 bool GSPcsx2Backend::Requested() { return false; }
 void GSPcsx2Backend::AttachHostWindow(void *) {}
 void GSPcsx2Backend::HostTick() {}
@@ -580,8 +622,10 @@ bool GSPcsx2Backend::Active() { return false; }
 void GSPcsx2Backend::SetOsd(const char *, uint32_t, float, const char *) {}
 void GSPcsx2Backend::SetMenu(void *, void *) {}
 void GSPcsx2Backend::SetMenuInput(const void *) {}
-void GSPcsx2Backend::SetHostUiVisible(bool) {}
+void GSPcsx2Backend::SetHostUiVisible(HostOverlay, bool) {}
 bool GSPcsx2Backend::HostUiVisible() { return false; }
+void GSPcsx2Backend::RequestPreview() {}
+GSPcsx2Backend::PreviewFrame GSPcsx2Backend::TakePreview() { return {}; }
 uint64_t GSPcsx2Backend::Presents() { return 0u; }
 GSPcsx2Backend::GSPcsx2Backend() = default;
 GSPcsx2Backend::~GSPcsx2Backend() = default;

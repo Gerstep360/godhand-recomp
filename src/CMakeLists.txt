@@ -43,9 +43,11 @@ set(GODHAND_HOST_SOURCES
     godhand/hle_bindings.cpp
     godhand/host_window.cpp
     godhand/log.cpp
+    godhand/native_transforms.cpp
     godhand/prompt_art.cpp
     godhand/sha256.cpp
     godhand/thread_policy.cpp
+    godhand/pc_options.cpp
 )
 
 # godhand.ini (top level) is built into godhand.exe as its default settings: godhand_generated/godhand/default_ini.h.
@@ -190,7 +192,16 @@ foreach(modulePack IN LISTS GODHAND_MODULE_PACKS)
     math(EXPR GODHAND_MODULE_COUNT "${GODHAND_MODULE_COUNT} + 1")
 endforeach()
 set(GODHAND_MODULE_LIBRARIES "")
-if(GODHAND_MODULE_SOURCES)
+set(GODHAND_MODULES_LIBRARY "" CACHE FILEPATH "Reuse unchanged generated SNR2 library for host-only builds")
+if(GODHAND_MODULES_LIBRARY)
+    if(NOT EXISTS "${GODHAND_MODULES_LIBRARY}")
+        message(FATAL_ERROR "Cached SNR2 library does not exist: ${GODHAND_MODULES_LIBRARY}")
+    endif()
+    add_library(godhand_modules STATIC IMPORTED)
+    set_target_properties(godhand_modules PROPERTIES IMPORTED_LOCATION "${GODHAND_MODULES_LIBRARY}")
+    target_link_libraries(godhand_modules INTERFACE ps2_runtime)
+    set(GODHAND_MODULE_LIBRARIES godhand_modules)
+elseif(GODHAND_MODULE_SOURCES)
     add_library(godhand_modules STATIC ${GODHAND_MODULE_SOURCES})
     target_include_directories(godhand_modules PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(godhand_modules PUBLIC ps2_runtime)
@@ -225,6 +236,8 @@ file(WRITE "${GODHAND_MODULE_INDEX}.tmp"
 file(COPY_FILE "${GODHAND_MODULE_INDEX}.tmp" "${GODHAND_MODULE_INDEX}" ONLY_IF_DIFFERENT)
 
 add_executable(godhand ${GODHAND_HOST_SOURCES} "${GODHAND_MODULE_INDEX}")
+# The embedded settings must rebuild even with a localized MSVC /showIncludes dependency prefix.
+set_property(SOURCE main.cpp APPEND PROPERTY OBJECT_DEPENDS "${GODHAND_INI_HEADER}")
 if(GODHAND_MODULE_LIBRARIES)
     target_link_libraries(godhand PRIVATE ${GODHAND_MODULE_LIBRARIES})
 endif()
@@ -261,7 +274,16 @@ endif()
 # VU1 microcode compiled ahead of time: capture the code images with PS2X_VU1_CAPTURE, then run vu1_recomp (configure
 # with -DGODHAND_BUILD_TOOLS=ON) into generated/vu1. Images not compiled stay interpreted. GENERIC (Urban, SotC).
 file(GLOB GODHAND_VU1_SOURCES CONFIGURE_DEPENDS "${GODHAND_GENERATED_DIR}/vu1/*.cpp")
-if(GODHAND_VU1_SOURCES)
+set(GODHAND_VU1_LIBRARY "" CACHE FILEPATH "Reuse unchanged generated VU1 library for host-only builds")
+if(GODHAND_VU1_LIBRARY)
+    if(NOT EXISTS "${GODHAND_VU1_LIBRARY}")
+        message(FATAL_ERROR "Cached VU1 library does not exist: ${GODHAND_VU1_LIBRARY}")
+    endif()
+    add_library(godhand_vu1_code STATIC IMPORTED)
+    set_target_properties(godhand_vu1_code PROPERTIES IMPORTED_LOCATION "${GODHAND_VU1_LIBRARY}")
+    target_link_libraries(godhand PRIVATE godhand_vu1_code)
+    target_compile_definitions(godhand PRIVATE GODHAND_HAS_VU1_PROGRAMS=1)
+elseif(GODHAND_VU1_SOURCES)
     add_library(godhand_vu1_code STATIC ${GODHAND_VU1_SOURCES})
     target_include_directories(godhand_vu1_code PRIVATE "${CMAKE_SOURCE_DIR}/runtime/ps2xRuntime/src/lib/vu")
     target_link_libraries(godhand_vu1_code PUBLIC ps2_runtime)
@@ -270,9 +292,19 @@ if(GODHAND_VU1_SOURCES)
     if(MSVC)
         target_compile_options(godhand_vu1_code PRIVATE /bigobj /fp:precise ${GODHAND_ARCH_FLAG} /W0 /MP /d2OptimizeHugeFunctions $<$<CONFIG:RelWithDebInfo>:/Ob2>)
     endif()
+else()
+    message(WARNING "No VU AOT programs: 3D will run in the slow interpreter. After playing, run: python -I build.py vu1")
 endif()
 
 set_target_properties(godhand PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
     VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
 )
+
+set(GODHAND_EXTRAS_DIR "" CACHE PATH "Optional sibling godhand-extras source directory")
+if(GODHAND_EXTRAS_DIR)
+    if(NOT EXISTS "${GODHAND_EXTRAS_DIR}/cmake/GodHandExtras.cmake")
+        message(FATAL_ERROR "Invalid GODHAND_EXTRAS_DIR: ${GODHAND_EXTRAS_DIR}")
+    endif()
+    include("${GODHAND_EXTRAS_DIR}/cmake/GodHandExtras.cmake")
+endif()

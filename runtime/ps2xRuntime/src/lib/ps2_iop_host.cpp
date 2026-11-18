@@ -287,6 +287,8 @@ std::string PS2IopHostAdapter::hostPath(ps2x::iop::HostPathKind kind) const
     case ps2x::iop::HostPathKind::CdRoot:
         return paths.cdRoot.string();
     case ps2x::iop::HostPathKind::CdImage:
+        if (auto &disc = PS2CdImage::instance(); disc.isInstalled())
+            return "<cdimage>:0:" + std::to_string(disc.sizeBytes());
         return paths.cdImage.string();
     case ps2x::iop::HostPathKind::HostRoot:
         return paths.hostRoot.string();

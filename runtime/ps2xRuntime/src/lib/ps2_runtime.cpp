@@ -22,6 +22,7 @@
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
+#include "runtime/ps2_host_ui.h"
 #include "ps2_iop_host.h"
 #include "ps2_host_input.h"
 void ps2xSetLocalToHostGs(GS *gs); // ps2_memory.cpp: VIF1 FIFO image downloads
@@ -92,10 +93,31 @@ namespace ps2_host_display
         startFullscreen = enabled;
     }
 
-    bool vsyncEnabled()
-    {
-        static const bool enabled = [] { const char *v = std::getenv("PS2X_VSYNC"); return !v || *v != '0'; }();
-        return enabled;
+    std::atomic<int> desiredVsync{-1}, desiredFrameLimit{-1};
+    bool vsyncEnabled() {
+        if(desiredVsync.load()<0) {const char *v=std::getenv("PS2X_VSYNC");desiredVsync.store(!v || *v!='0');}
+        return desiredVsync.load()!=0;
+    }
+    void setVsync(bool enabled) {desiredVsync.store(enabled?1:0);}
+    bool setFrameLimit(int frames) {
+        if(frames!=0 && frames!=30 && frames!=60 && frames!=120) return false;
+        desiredFrameLimit.store(frames); return true;
+    }
+    int frameLimit() {
+        if(desiredFrameLimit.load()<0) {
+            const char *v=std::getenv("PS2X_PRESENT_FPS");
+            char *end=nullptr;const long parsed=v?std::strtol(v,&end,10):60;
+            if((v && (end==v || *end)) || (parsed!=0 && parsed!=30 && parsed!=60 && parsed!=120)) desiredFrameLimit.store(60);
+            else setFrameLimit(static_cast<int>(parsed));
+        }
+        return desiredFrameLimit.load();
+    }
+    void applyPresentSettings() {
+        static int appliedVsync=-1,appliedLimit=-1;
+        const int sync=vsyncEnabled()?1:0, limit=frameLimit();
+        const bool syncChanged=sync!=appliedVsync;
+        if(syncChanged) {if(sync) SetWindowState(FLAG_VSYNC_HINT);else ClearWindowState(FLAG_VSYNC_HINT);appliedVsync=sync;}
+        if(appliedLimit!=limit || syncChanged) {SetTargetFPS(limit==60 && sync?0:limit);appliedLimit=limit;}
     }
 
     // PS2X_PRESENT_SYNC (on by default, =0 disables): present once per emulated field. The present loop waits (up to
@@ -106,7 +128,7 @@ namespace ps2_host_display
     bool presentSyncEnabled()
     {
         static const bool enabled = [] { const char *v = std::getenv("PS2X_PRESENT_SYNC"); return !v || *v != '0'; }();
-        return enabled;
+        return enabled && frameLimit()==60;
     }
 
     std::mutex overlayMutex;
@@ -212,6 +234,8 @@ namespace ps2_host_display
                           static_cast<double>(frames - startFrames) / seconds, presents / seconds, 100.0 * fields / 59.94,
                           worstPresentMs);
             text = line;
+            static const bool logPresents=std::getenv("PS2X_PRESENT_STATS")!=nullptr;
+            if(logPresents) std::fprintf(stderr,"[present] %s\n",line);
             {
                 std::lock_guard<std::mutex> lock(ps2_host_display::overlayMutex);
                 lastFpsLine = line;
@@ -1060,6 +1084,38 @@ bool PS2Runtime::syncCoreSubsystems()
     return true;
 }
 
+namespace ps2x::hostui
+{
+    namespace
+    {
+        Callback initFn = nullptr, startupFn = nullptr, drawFn = nullptr, shutdownFn = nullptr, tickFn = nullptr;
+        thread_local bool preparing = false;
+        std::atomic<bool> closeRequested{false};
+        std::atomic<uint64_t> progress{0};
+    }
+    void install(Callback init, Callback startup, Callback draw, Callback shutdown, Callback tick)
+    { initFn = init; startupFn = startup; drawFn = draw; shutdownFn = shutdown; tickFn = tick; }
+    void initialize() { if (initFn) initFn(); }
+    void beginStartup() { preparing = startupFn != nullptr; closeRequested = false; }
+    bool preparingOnThisThread() { return preparing; }
+    bool closing() { return closeRequested.load(std::memory_order_relaxed); }
+    void startupFrame()
+    {
+        if (!preparing) return;
+        if (WindowShouldClose()) closeRequested = true;
+        startupFn();
+    }
+    void endStartup() { preparing = false; }
+    void draw() { if (drawFn) drawFn(); }
+    void tick() { if (tickFn) tickFn(); }
+    void shutdown() { if (shutdownFn) shutdownFn(); }
+    void setInputBlocked(bool blocked) { ps2_host_input::setOverlayOpen(blocked); }
+    void shaderProgress(uint32_t done, uint32_t total)
+    { progress.store((uint64_t(total) << 32) | done, std::memory_order_relaxed); }
+    void shaderProgress(uint32_t &done, uint32_t &total, bool)
+    { const auto p = progress.load(std::memory_order_relaxed); done = uint32_t(p); total = uint32_t(p >> 32); }
+}
+
 bool PS2Runtime::initialize(const char *title)
 {
     try
@@ -1075,8 +1131,16 @@ bool PS2Runtime::initialize(const char *title)
 #else
         // Real vsync (PS2X_VSYNC=0 goes back to the software 60 FPS limiter): the limiter was not aligned with the
         // monitor's refresh, so presents landed at a drifting phase and frames were shown for 1 or 3 refreshes.
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_ALWAYS_RUN | (ps2_host_display::vsyncEnabled() ? FLAG_VSYNC_HINT : 0u));
+        // Startup pumps an overlay while the GS creates shared GL contexts. A
+        // vsynced swap here can serialize/deadlock AMD's driver with that worker.
+        // Apply the user's VSync only after the device and shader cache are ready.
+        SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_ALWAYS_RUN);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        SetExitKey(KEY_NULL);
+        SetTargetFPS(60);
+        ps2x::hostui::initialize();
+        ps2x::hostui::beginStartup();
+        ps2x::hostui::startupFrame(); // first painted frame precedes audio/GS/driver initialization
         if (ps2_host_display::startMaximized)
             MaximizeWindow();
         if (ps2_host_display::startFullscreen)
@@ -1085,17 +1149,21 @@ bool PS2Runtime::initialize(const char *title)
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         GSSharedPresent::CaptureHostContext();
+        GSSharedPresent::RestoreHostContext(); // keep the window's context available for startup UI while GS works
         ps2xHostVsyncSetWindow(GetWindowHandle()); // the vblank lock follows the window's monitor (Kernel/host_vsync.cpp)
         GSPcsx2Backend::AttachHostWindow(GetWindowHandle()); // PCSX2's GS: its child window over the game area
 #endif
         const bool coreReady = syncCoreSubsystems();
         GSSharedPresent::RestoreHostContext();
+        ps2x::hostui::endStartup();
+        if (ps2x::hostui::closing())
+            return false;
         if (!coreReady)
         {
             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
             return false;
         }
-        SetTargetFPS(ps2_host_display::vsyncEnabled() ? 0 : 60);
+        ps2_host_display::applyPresentSettings();
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -3020,6 +3088,7 @@ void PS2Runtime::run()
     ps2_host_display::FpsOverlay fpsOverlay;
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
+        ps2_host_display::applyPresentSettings();
         if (IsWindowMinimized())
         {
             PollInputEvents();
@@ -3134,6 +3203,7 @@ void PS2Runtime::run()
         // top (PROGRESS §98). PS2X_HOST_PRESENT=1 always presents, as before.
         static const bool alwaysPresent = []
         { const char *v = std::getenv("PS2X_HOST_PRESENT"); return v && *v == '1'; }();
+        ps2x::hostui::tick();
         const bool hostPresents = !pcsx2Gs || alwaysPresent || GSPcsx2Backend::HostUiVisible();
         if (!hostPresents)
             PollInputEvents();
@@ -3177,6 +3247,7 @@ void PS2Runtime::run()
             }
         }
         ps2x::controls::draw(); // F1 Controls screen: host back buffer only, never the GS
+        ps2x::hostui::draw();
         if (!screenshotFields.empty() && eeScheduler().currentVSyncTick() >= screenshotFields.back())
         {
             if (const char *directory = std::getenv("PS2X_SCREENSHOT_DIR"))
@@ -3271,6 +3342,7 @@ void PS2Runtime::run()
 
     // Window closed or run stopped: the Controls screen closes and unsaved edits are written (main ends in _Exit).
     ps2x::controls::shutdown();
+    ps2x::hostui::shutdown();
     requestStop();
     if (gameThread.joinable())
     {
@@ -3284,6 +3356,8 @@ void PS2Runtime::run()
     }
     if (frameTex.id != 0)
         UnloadTexture(frameTex);
+    if (GSPcsx2Backend::Active())
+        m_gs.releaseRasterBackend();
     GSSharedPresent::ShutdownHost();
     ps2_host_input::releaseMouse();
     CloseWindow();

@@ -6,6 +6,7 @@
                                                       unchanged modules are skipped (stamp)
     python -I build.py configure [-DOPTION=...]       CMake configure (Ninja, RelWithDebInfo, no LTCG)
     python -I build.py build [target]                 compile godhand.exe (configures first if needed)
+    python -I build.py vu1 [capture-dir ...]          compile captured VU programs and rebuild (no EE regeneration)
     python -I build.py all [--iso X]                  generate -> configure -> build
     python -I build.py boot [--seconds N] [--iso X]   one hidden, time-capped run; output in build/port/bin/logs
     python -I build.py run [args]                     a normal run in a window (arguments go to godhand.exe)
@@ -89,6 +90,7 @@ def in_vs(*cmd):
         print(f"{VSENV} is missing (copy tools/win/vsenv.cmd from the Urban Reign port).")
         return 1
     env = dict(os.environ)
+    env["VSLANG"] = "1033"
     vsroot = find_vsroot()
     if vsroot:
         env["VSROOT"] = vsroot
@@ -571,8 +573,10 @@ def configure(extra=()):
             src = Path(deps) / f"{name}-src"
             if src.is_dir():
                 args.append(f"-DFETCHCONTENT_SOURCE_DIR_{name.upper()}={src.as_posix()}")
-    # Never download at configure time unless asked: a missing dependency fails instead.
-    if os.environ.get("GODHAND_ALLOW_DOWNLOADS") != "1":
+    # With a local or existing _deps folder, never download at configure time unless asked.
+    # Without one (a fresh checkout), CMake downloads dependencies as usual.
+    has_local_deps = (BUILD / "_deps" / "raylib-src").is_dir()
+    if (deps or has_local_deps) and os.environ.get("GODHAND_ALLOW_DOWNLOADS") != "1":
         args.append("-DFETCHCONTENT_FULLY_DISCONNECTED=ON")
     # The recompiler is not part of the game build; only an explicit -DGODHAND_BUILD_RECOMP=ON turns it on, and every
     # other configure resets it (a stale ON would pull elfio, toml11, fmt, libdwarf and rabbitizer).
@@ -589,7 +593,7 @@ def build(target="godhand"):
     if not has_generated_code():
         print("The recompiled game code is missing: run 'python -I build.py generate' first.")
         return 1
-    if game_running():
+    if target == "godhand" and game_running():
         print("godhand.exe is running: close it first (the link would fail).")
         return 1
     # build.ninja, not CMakeCache.txt: CMake writes the cache even when configure fails.
@@ -598,6 +602,7 @@ def build(target="godhand"):
     # The output is also written to build/port/last_build.log for the link gate below.
     log_path = BUILD / "last_build.log"
     env = dict(os.environ)
+    env["VSLANG"] = "1033"
     vsroot = find_vsroot()
     if vsroot:
         env["VSROOT"] = vsroot
@@ -624,6 +629,64 @@ def build(target="godhand"):
 
 def build_all(args=()):
     return generate(args) or configure() or build()
+
+
+def vu1(args=()):
+    """Keep a local corpus, translate with the existing VU compiler, and rebuild only changed sources."""
+    if game_running():
+        print("Close godhand.exe before rebuilding its VU programs.")
+        return 1
+    corpus = ROOT / "build" / "vu_corpus"
+    sources = [BIN / "logs" / "vu1_missing", BIN / "logs" / "vu0_missing", *map(Path, args)]
+    for source in sources:
+        if not source.is_dir():
+            if source in sources[2:]:
+                print(f"Capture directory not found: {source}")
+                return 1
+            continue
+        for image in sorted(source.glob("vu1_*.bin")):
+            data = image.read_bytes()
+            if len(data) != 16384:
+                print(f"{image}: expected a 16384-byte VU image, got {len(data)}")
+                return 1
+            # Validate the content address before adding it to the persistent corpus.
+            digest = 0xCBF29CE484222325
+            for byte in data:
+                digest = ((digest ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+            if image.stem.lower() != f"vu1_{digest:016x}":
+                print(f"{image}: image hash does not match its filename")
+                return 1
+            corpus.mkdir(parents=True, exist_ok=True)
+            target = corpus / image.name.lower()
+            if not target.exists() or target.read_bytes() != data:
+                target.write_bytes(data)
+    images = sorted(corpus.glob("vu1_*.bin"))
+    if not images:
+        print("No VU captures yet. Play a 3D scene, close the game, then run this command again.")
+        return 1
+    print(f"VU corpus: {len(images)} images (previous captures are retained)", flush=True)
+    if configure(["-DGODHAND_BUILD_TOOLS=ON"]) or build("vu1_recomp"):
+        return 1
+    staging = ROOT / "build" / "vu1_staging"
+    tool = BUILD / "runtime" / "ps2xTest" / "vu1_recomp.exe"
+    if run([tool, corpus, staging]):
+        return 1
+    # Do not discard existing AOT programs when importing only a subset of an older capture corpus.
+    output = GENERATED / "vu1"
+    if output.is_dir():
+        old_registry = output / "vu1_programs.cpp"
+        new_registry = staging / "vu1_programs.cpp"
+        if old_registry.exists():
+            old = old_registry.read_text(encoding="utf-8")
+            new = new_registry.read_text(encoding="utf-8")
+            # A registry can only be regenerated safely from the whole corpus. Refuse before changing output.
+            old_hashes = set(re.findall(r"registerVu1CompiledProgram\((0x[0-9A-Fa-f]+ull)", old))
+            new_hashes = set(re.findall(r"registerVu1CompiledProgram\((0x[0-9A-Fa-f]+ull)", new))
+            if old_hashes - new_hashes:
+                print("Existing AOT images are missing from this corpus; pass their capture directory as well.")
+                return 1
+    sync_tree(staging, output)
+    return configure(["-DGODHAND_BUILD_TOOLS=ON"]) or build()
 
 
 # ---- run / boot ---------------------------------------------------------------------------------------------------
@@ -754,6 +817,7 @@ def status(args=()):
         ("disc image", iso or ROOT / "game" / "<none>.iso"),
         ("boot ELF copy", ROOT / "build" / BOOT_ELF),
         ("generated code", GENERATED / "register_functions.cpp"),
+        ("VU AOT programs (3D acceleration)", GENERATED / "vu1" / "vu1_programs.cpp"),
         ("CMake cache", BUILD / "CMakeCache.txt"),
         ("godhand.exe", EXE),
         ("tools/win/vsenv.cmd", VSENV),
@@ -770,6 +834,7 @@ COMMANDS = {
     "configure": lambda a: configure(a),
     "build": lambda a: build(a[0] if a else "godhand"),
     "all": build_all,
+    "vu1": vu1,
     "boot": boot,
     "run": play,
     "play": play,

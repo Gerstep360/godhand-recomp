@@ -3698,14 +3698,16 @@ struct VU1InterpreterAccess
         while (copies > 0u && x.active)
         {
             const uint64_t inTag = x.currentTagEnd > x.copiedBytes ? (x.currentTagEnd - x.copiedBytes) / 16u : 0u;
-            if (x.currentTagEnd == 0u || inTag <= 1u || x.copiedBytes > VU1Interpreter::XgkickPipeline::kBufferSize - 16u)
+            if (x.currentTagEnd == 0u || inTag == 0u || x.copiedBytes > VU1Interpreter::XgkickPipeline::kBufferSize - 16u)
             {
                 x.cycleCredit = 1u;
                 vu.progressXgkick();
                 --copies;
                 continue;
             }
-            uint32_t bulk = static_cast<uint32_t>(std::min<uint64_t>(copies, inTag - 1u)) * 16u;
+            // The tag has already been decoded. Transfer its ready qwords as
+            // contiguous host spans, including the final payload qword.
+            uint32_t bulk = static_cast<uint32_t>(std::min<uint64_t>(copies, inTag)) * 16u;
             copies -= bulk / 16u;
             while (bulk != 0u)
             {
@@ -3714,6 +3716,19 @@ struct VU1InterpreterAccess
                 std::memcpy(x.packet.data() + x.copiedBytes, vu.m_activeVuData + source, chunk);
                 x.copiedBytes += chunk;
                 bulk -= chunk;
+            }
+            if (x.copiedBytes == x.currentTagEnd)
+            {
+                if (x.currentTagEop)
+                {
+                    x.cycleCredit = 0u;
+                    vu.finishXgkick();
+                }
+                else
+                {
+                    x.currentTagEnd = 0u;
+                    x.currentTagEop = false;
+                }
             }
         }
         if (x.active)

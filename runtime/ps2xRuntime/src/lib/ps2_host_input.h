@@ -21,6 +21,10 @@ namespace ps2_host_input
     void releaseMouse();
     // The pad at a controller port and multitap slot (0 = A, the pad plugged straight in).
     [[nodiscard]] ps2x::iop::PadInputState padState(uint32_t port, uint32_t slot = 0u);
+    // Optional host-owned logical input filter. Never called while an overlay blocks input.
+    // The callback may run on EE/IOP threads; detach it before destroying its state.
+    using PadFilter = void (*)(uint32_t player, ps2x::iop::PadInputState &);
+    void setPadFilter(PadFilter);
     // The motors the game set on that pad (any thread); played on the controllers of its LargeMotor/SmallMotor bindings.
     void setVibration(uint32_t port, uint32_t slot, uint8_t smallMotor, uint8_t largeMotor);
     // While blocked (the in-game menu is open) every pad stays plugged in but idle, so the game keeps running.
@@ -55,6 +59,9 @@ namespace ps2_host_input
         [[nodiscard]] bool envOverride(uint32_t pad); // PS2X_PAD<n> in the environment wins over the file
         [[nodiscard]] std::vector<std::string> bindings(uint32_t pad, std::string_view key);
         void setBindings(uint32_t pad, std::string_view key, std::vector<std::string> list); // live at once, unsaved
+        // Host profiles: affect live input/prompts without dirtying the player's controls file.
+        void setTemporaryBindings(uint32_t pad, std::string_view key, std::vector<std::string> list);
+        void clearTemporaryBindings(uint32_t pad, std::string_view key);
         void resetDefaults(uint32_t pad);
         // Writes the file when something changed (tmp + replacing rename, retried); false = still unsaved.
         bool save(std::string &message);

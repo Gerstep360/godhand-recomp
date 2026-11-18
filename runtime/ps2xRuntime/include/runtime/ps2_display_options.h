@@ -11,6 +11,11 @@ namespace ps2_host_display
     void setStartMaximized(bool enabled);
     // Borderless fullscreen at start (like F11).
     void setStartFullscreen(bool enabled);
+    bool setFrameLimit(int frames); // host presentation only: 0,30,60,120
+    int frameLimit();
+    void setVsync(bool enabled);
+    bool vsyncEnabled();
+    void applyPresentSettings(); // window thread; never changes EE/IOP timing
     // Game frames for the FPS overlay (F3): the port calls this once per iteration of the game's main loop.
     void noteGameFrame();
     // A line shown on screen (top left) until replaced or cleared with an empty string, e.g. "capturing profile".

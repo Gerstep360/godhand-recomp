@@ -1,6 +1,7 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
+#include "stereo_delay.h"
 #include <algorithm>
 #include <cmath>
 #include <span>
@@ -233,6 +234,13 @@ struct PS2AudioBackend::Impl
     std::array<int16_t, 2> fadeSource{};
     std::array<int16_t, 2> gapSource{};
     std::mutex pcmMutex;
+    struct Effect {
+        void *owner = nullptr;
+        std::shared_ptr<const std::vector<int16_t>> samples;
+        size_t cursor = 0;
+        float volume = 1;
+    };
+    std::array<Effect, 8> effects;
     AudioStream stream{};
     bool streamReady = false;
     std::FILE *dump = nullptr;
@@ -249,6 +257,7 @@ struct PS2AudioBackend::Impl
     uint64_t underruns = 0u;
     uint64_t droppedFrames = 0u;
     std::chrono::steady_clock::time_point statsStart = std::chrono::steady_clock::now();
+    ps2x::audio::StereoDelay stereoDelay;
     static Impl *streamOwner;
 
     static void audioCallback(void *buffer, unsigned int frames)
@@ -329,6 +338,20 @@ struct PS2AudioBackend::Impl
             output[frame * 2u] = owner->lastOutput[0];
             output[frame * 2u + 1u] = owner->lastOutput[1];
         }
+        for (auto &effect : owner->effects)
+        {
+            if (!effect.samples || effect.cursor >= effect.samples->size())
+                continue;
+            const size_t count = std::min(requested, effect.samples->size() - effect.cursor);
+            for (size_t i = 0; i < count; ++i)
+            {
+                const int32_t sample = (*effect.samples)[effect.cursor + i];
+                const int32_t mixed = output[i] + static_cast<int32_t>(sample * effect.volume);
+                output[i] = static_cast<int16_t>(std::clamp(mixed, -32768, 32767));
+            }
+            effect.cursor += count;
+        }
+        owner->stereoDelay.apply(std::span<int16_t>(output, requested));
         if (owner->outDump)
         {
             std::fwrite(output, sizeof(int16_t), requested, owner->outDump);
@@ -361,6 +384,38 @@ struct PS2AudioBackend::Impl
 
 PS2AudioBackend::Impl *PS2AudioBackend::Impl::streamOwner = nullptr;
 
+bool PS2AudioBackend::playEffect(void *owner, std::shared_ptr<const std::vector<int16_t>> samples, float volume)
+{
+    if (!samples || samples->empty() || samples->size() % 2 || !std::isfinite(volume))
+        return false;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_impl->streamReady)
+        return false;
+    std::lock_guard<std::mutex> pcmLock(m_impl->pcmMutex);
+    auto &effects = m_impl->effects;
+    auto slot = std::find_if(effects.begin(), effects.end(), [&](const Impl::Effect &effect)
+    {
+        return effect.owner == owner && effect.samples == samples;
+    });
+    if (slot == effects.end())
+        slot = std::find_if(effects.begin(), effects.end(), [](const Impl::Effect &effect)
+        {
+            return !effect.samples || effect.cursor >= effect.samples->size();
+        });
+    if (slot == effects.end())
+        return false;
+    *slot = {owner, std::move(samples), 0, std::clamp(volume, 0.0f, 1.0f)};
+    return true;
+}
+
+void PS2AudioBackend::stopEffects(void *owner)
+{
+    std::lock_guard<std::mutex> lock(m_impl->pcmMutex);
+    for (auto &effect : m_impl->effects)
+        if (effect.owner == owner || !owner)
+            effect = {};
+}
+
 PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
 {
 }
@@ -383,6 +438,22 @@ void PS2AudioBackend::setAudioReady(bool ready)
 #if !defined(PLATFORM_VITA)
     if (ready)
     {
+        if (const char *value = std::getenv("GODHAND_STEREO_OFFSET_MS"))
+        {
+            char *end = nullptr;
+            const double ms = std::strtod(value, &end);
+            if (end != value && *end == '\0' && std::isfinite(ms) && std::abs(ms) <= 100.0)
+            {
+                m_impl->stereoDelay.configure(static_cast<int>(std::lround(ms * 48.0)));
+                if (ms != 0.0)
+                    std::fprintf(stderr, "[audio] stereo offset %.3f ms (positive delays left)\n", ms);
+            }
+            else
+            {
+                std::fprintf(stderr, "[audio] ignored invalid stereo offset; expected -100 to 100 ms\n");
+                m_impl->stereoDelay.configure(0);
+            }
+        }
         const char *audioStats = std::getenv("PS2X_AUDIO_STATS");
         m_impl->statsEnabled = audioStats && *audioStats && *audioStats != '0';
         m_impl->statsStart = std::chrono::steady_clock::now();
@@ -435,6 +506,7 @@ void PS2AudioBackend::setAudioReady(bool ready)
 void PS2AudioBackend::resetPcm()
 {
     std::lock_guard<std::mutex> lock(m_impl->pcmMutex);
+    m_impl->stereoDelay.reset();
     m_impl->read = 0u;
     m_impl->queued = 0u;
     m_impl->readFraction = 0.0;
@@ -462,6 +534,8 @@ void PS2AudioBackend::resetPcm()
 
 void PS2AudioBackend::submitPcm(std::span<const int16_t> samples)
 {
+    // The queue, rate controller and output callback operate in stereo frames.
+    samples = samples.first(samples.size() & ~size_t{1});
     std::lock_guard<std::mutex> lock(m_impl->pcmMutex);
     if (m_impl->dump && samples.size_bytes() <= 0xFFFFFF00u - m_impl->dumpBytes)
     {

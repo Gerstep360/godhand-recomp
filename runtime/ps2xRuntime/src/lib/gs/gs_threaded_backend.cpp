@@ -3,6 +3,7 @@
 #include "runtime/gs/gs_gpu_backend.h"
 #include "runtime/gs/gs_pcsx2_backend.h"
 #include "runtime/gs/gs_shared_present.h"
+#include "runtime/ps2_host_ui.h"
 #include "ThreadPriority.h"
 #include "ThreadNaming.h"
 
@@ -314,6 +315,17 @@ void GSThreadedBackend::Drain() const
         target = m_published;
     }
     std::unique_lock<std::mutex> lock(m_queueMutex);
+    if (ps2x::hostui::preparingOnThisThread())
+    {
+        while (m_completed < target && !m_stop)
+        {
+            m_doneCv.wait_for(lock, std::chrono::milliseconds(16));
+            lock.unlock();
+            ps2x::hostui::startupFrame();
+            lock.lock();
+        }
+        return;
+    }
     if (g_gsWaitStats)
     {
         const int64_t t0 = gsWaitNowNs();

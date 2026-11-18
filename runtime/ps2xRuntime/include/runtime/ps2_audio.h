@@ -27,6 +27,9 @@ public:
     void setAudioReady(bool ready);
     void submitPcm(std::span<const int16_t> samples);
     void resetPcm();
+    // Short host effects mixed with the game's output at 48 kHz stereo.
+    bool playEffect(void *owner, std::shared_ptr<const std::vector<int16_t>> samples, float volume);
+    void stopEffects(void *owner);
 
 private:
     struct DecodedSample

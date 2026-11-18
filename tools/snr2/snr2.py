@@ -39,9 +39,14 @@ from snr2fmt import JR_RA, Module, RELOC_TYPES, STREAM_KINDS, SYM_TYPES, branch_
 from snr2link import LinkError, Registry, link  # noqa: E402
 
 PORT = os.path.normpath(os.path.join(HERE, "..", ".."))
-DEF_ISO = os.path.normpath(os.path.join(PORT, "..", "disc", "God Hand (USA).iso"))
+DEF_ISO = (
+    os.environ.get("GODHAND_ISO")
+    or (os.path.join(PORT, "game", "God Hand (USA).iso") if os.path.exists(os.path.join(PORT, "game", "God Hand (USA).iso")) else None)
+    or os.path.normpath(os.path.join(PORT, "..", "disc", "God Hand (USA).iso"))
+)
 DEF_REL = os.path.join(PORT, "build", "snr2", "rel")
 DEF_OUT = os.path.join(PORT, "build", "snr2", "out")
+DEF_BOOT = os.path.join(PORT, "build", "SLUS_215.03")
 
 
 # ------------------------------------------------------------------------------------------------ inputs
@@ -61,6 +66,9 @@ class Ctx:
         if self._boot is None:
             if getattr(self.a, "boot_elf", None):
                 with open(self.a.boot_elf, "rb") as f:
+                    self._boot = f.read()
+            elif os.path.exists(DEF_BOOT):
+                with open(DEF_BOOT, "rb") as f:
                     self._boot = f.read()
             else:
                 self._boot = self.disc.read_root_file("SLUS_215.03")
@@ -668,7 +676,8 @@ def main(argv=None):
                    help="treat every weak-symbol site as runtime-relocated, even when no DLL exports the name strongly")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list")
-    sub.add_parser("extract")
+    s_ext = sub.add_parser("extract")
+    s_ext.add_argument("--iso", default=DEF_ISO)
     s = sub.add_parser("info")
     s.add_argument("module")
     s.add_argument("--symbols", action="store_true")

@@ -468,6 +468,7 @@ namespace ps2_host_input
         // Window thread only: sample() (the only reader of the tables), the Controls screen and setControlsFile (before
         // the run loop) all run there, so the tables need no lock.
         ControlsModel g_model;                    // the file's content (or the defaults without a file)
+        std::array<std::map<size_t,std::vector<std::string>>,kMaxPlayers> g_temporaryBindings;
         std::string g_controlsPath;               // empty: no file, edits last until the game closes
         bool g_controlsDirty = false;             // edited since the last save
         bool g_configsValid = false;
@@ -663,10 +664,12 @@ namespace ps2_host_input
             {
                 if (envPad(pad))
                     g_configs[pad] = envPadConfig(pad);
-                else if (g_model.pads[pad].present)
-                    g_configs[pad] = configFromSection(g_model.pads[pad], pad);
                 else
-                    g_configs[pad] = configFromSection(defaultSection(pad), pad);
+                {
+                    auto section=g_model.pads[pad].present?g_model.pads[pad]:defaultSection(pad);
+                    for(const auto &[index,list]:g_temporaryBindings[pad]) section.bindings[index]=list;
+                    g_configs[pad]=configFromSection(section,pad);
+                }
             }
             g_configsValid = true;
             publishPrompts(g_configs[0]); // every rebuild: file load, the 1-s file poll, F1 edits, reset
@@ -1253,6 +1256,7 @@ namespace ps2_host_input
         std::atomic<uint32_t> g_invertRightDefault{0u};
         std::atomic<bool> g_mouseCameraEnabled{false};
         std::atomic<bool> g_mouseStickEnabled{true};
+        std::atomic<bool> g_blocked{false}; // the in-game menu has the input
         bool g_mouseLocked = false;
         int g_ignoredMouseButton = -1;
         bool g_skipMouseDelta = false;
@@ -1264,23 +1268,20 @@ namespace ps2_host_input
 
         void recordMouseCameraInput(Vector2 delta, bool active)
         {
+            static auto clickUntil = std::chrono::steady_clock::time_point{};
             std::lock_guard<std::mutex> lock(g_mutex);
             if (!active)
             {
                 g_mouseCameraInput = {};
+                clickUntil = {};
                 return;
             }
-            g_mouseCameraInput.active = true;
-            if (delta.x == 0.0f && delta.y == 0.0f)
-                return;
             const auto now = std::chrono::steady_clock::now();
-            if ((g_mouseCameraInput.x == 0.0f && g_mouseCameraInput.y == 0.0f) ||
-                now - g_mouseInputStart > std::chrono::milliseconds(100))
-            {
-                g_mouseCameraInput.x = 0.0f;
-                g_mouseCameraInput.y = 0.0f;
-                g_mouseInputStart = now;
-            }
+            if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) || IsMouseButtonDown(MOUSE_BUTTON_RIGHT) ||
+                IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || IsMouseButtonPressed(MOUSE_BUTTON_RIGHT))
+                clickUntil = now + std::chrono::milliseconds(150);
+            g_mouseCameraInput.active = true;
+            g_mouseCameraInput.combatClick = now < clickUntil;
             g_mouseCameraInput.x += delta.x;
             g_mouseCameraInput.y += delta.y;
         }
@@ -1503,8 +1504,10 @@ namespace ps2_host_input
                 recordMouseCameraInput({}, false);
                 return;
             }
-            if (!IsWindowFocused() || IsKeyPressed(KEY_ESCAPE))
+            static bool s_escapeUnlocked = false;
+            if (!IsWindowFocused() || g_overlayOpen.load(std::memory_order_relaxed) || g_blocked.load(std::memory_order_relaxed))
             {
+                s_escapeUnlocked = false;
                 if (g_mouseLocked)
                     EnableCursor();
                 g_mouseLocked = false;
@@ -1512,27 +1515,40 @@ namespace ps2_host_input
                 recordMouseCameraInput({}, false);
                 return;
             }
-            if (!g_mouseLocked)
+            if (IsKeyPressed(KEY_ESCAPE))
             {
-                int button = -1;
-                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))
-                    button = MOUSE_BUTTON_LEFT;
-                else if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT))
-                    button = MOUSE_BUTTON_RIGHT;
-                else if (IsMouseButtonPressed(MOUSE_BUTTON_MIDDLE))
-                    button = MOUSE_BUTTON_MIDDLE;
-                if (button != -1)
-                {
-                    DisableCursor();
-                    g_mouseLocked = true;
-                    g_ignoredMouseButton = button;
-                    g_skipMouseDelta = true;
-                }
-                recordMouseCameraInput({}, g_mouseLocked);
+                s_escapeUnlocked = true;
+                if (g_mouseLocked)
+                    EnableCursor();
+                g_mouseLocked = false;
+                g_ignoredMouseButton = -1;
+                recordMouseCameraInput({}, false);
                 return;
             }
-            if (g_ignoredMouseButton != -1 && !IsMouseButtonDown(g_ignoredMouseButton))
+            if (s_escapeUnlocked)
+            {
+                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) || IsMouseButtonPressed(MOUSE_BUTTON_MIDDLE))
+                {
+                    s_escapeUnlocked = false;
+                }
+                else
+                {
+                    if (g_mouseLocked)
+                        EnableCursor();
+                    g_mouseLocked = false;
+                    recordMouseCameraInput({}, false);
+                    return;
+                }
+            }
+            if (!g_mouseLocked)
+            {
+                DisableCursor();
+                g_mouseLocked = true;
                 g_ignoredMouseButton = -1;
+                g_skipMouseDelta = true;
+                recordMouseCameraInput({}, true);
+                return;
+            }
             if (g_skipMouseDelta)
             {
                 g_skipMouseDelta = false;
@@ -1708,7 +1724,6 @@ namespace ps2_host_input
         // The motors each player's DualShock 2 was told to run (IOP thread), played on the controllers its
         // LargeMotor/SmallMotor bindings name (window thread). small: on/off, as on the pad; large: 0-255.
         std::array<std::atomic<uint16_t>, kMaxPlayers> g_motors{};
-        std::atomic<bool> g_blocked{false}; // the in-game menu has the input
         // Controls screen hold (window thread): players still idled after it closed, until released or the 2 s cap.
         uint32_t g_holdMask = 0u;
         std::chrono::steady_clock::time_point g_holdStart{};
@@ -1982,11 +1997,6 @@ namespace ps2_host_input
             input = g_mouseCameraInput;
             g_mouseCameraInput.x = 0.0f;
             g_mouseCameraInput.y = 0.0f;
-            if (std::chrono::steady_clock::now() - g_mouseInputStart > std::chrono::milliseconds(100))
-            {
-                input.x = 0.0f;
-                input.y = 0.0f;
-            }
         }
         const uint32_t invert = rightStickInvert();
         input.x *= mouseSensitivity() * ((invert & kInvertRightX) != 0u ? -1.0f : 1.0f);
@@ -2064,6 +2074,7 @@ namespace ps2_host_input
 
     void setControlsFile(const std::string &path, const std::vector<std::pair<std::string, std::string>> &legacy)
     {
+        for(auto &bindings:g_temporaryBindings) bindings.clear();
         g_controlsPath = path;
         g_model = defaultModel();
         g_controlsDirty = false;
@@ -2305,6 +2316,7 @@ namespace ps2_host_input
             const auto index = bindingKeyIndex(key);
             if (pad >= kMaxPlayers || !index)
                 return {};
+            if(const auto override=g_temporaryBindings[pad].find(*index);override!=g_temporaryBindings[pad].end()) return override->second;
             if (!g_model.pads[pad].present)
                 return defaultSection(pad).bindings[*index];
             return g_model.pads[pad].bindings[*index];
@@ -2315,17 +2327,30 @@ namespace ps2_host_input
             const auto index = bindingKeyIndex(key);
             if (pad >= kMaxPlayers || !index)
                 return;
+            g_temporaryBindings[pad].erase(*index); // An explicit F1 edit replaces this profile binding.
             if (!g_model.pads[pad].present)
                 g_model.pads[pad] = defaultSection(pad);
             g_model.pads[pad].bindings[*index] = std::move(list);
             g_controlsDirty = true;
             rebuildConfigs();
         }
+        void setTemporaryBindings(uint32_t pad,std::string_view key,std::vector<std::string> list)
+        {
+            const auto index=bindingKeyIndex(key);
+            if(pad>=kMaxPlayers || !index || envPad(pad)) return;
+            g_temporaryBindings[pad][*index]=std::move(list);rebuildConfigs();
+        }
+        void clearTemporaryBindings(uint32_t pad,std::string_view key)
+        {
+            const auto index=bindingKeyIndex(key);
+            if(pad<kMaxPlayers && index && g_temporaryBindings[pad].erase(*index)) rebuildConfigs();
+        }
 
         void resetDefaults(uint32_t pad)
         {
             if (pad >= kMaxPlayers)
                 return;
+            g_temporaryBindings[pad].clear();
             // The bindings only: the player's settings (Deadzone, AxisScale, Invert, motors, unknown keys) and notes stay.
             PadSection fresh = defaultSection(pad);
             if (g_model.pads[pad].present)
@@ -2561,6 +2586,8 @@ namespace ps2_host_input
         return settings;
     }
 
+    static std::atomic<PadFilter> g_padFilter{nullptr};
+    void setPadFilter(PadFilter filter) { g_padFilter.store(filter); }
     ps2x::iop::PadInputState padState(uint32_t port, uint32_t slot)
     {
         const int player = playerFor(port, slot);
@@ -2590,6 +2617,8 @@ namespace ps2_host_input
                 applyPressure(state);
             }
         }
+        if (!g_overlayOpen.load() && !g_blocked.load())
+            if (const auto filter = g_padFilter.load()) filter(static_cast<uint32_t>(player), state);
         return state;
     }
 }

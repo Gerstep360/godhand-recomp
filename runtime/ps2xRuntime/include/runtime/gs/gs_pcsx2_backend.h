@@ -10,11 +10,10 @@
 // PCSX2's GS (hardware renderer, pcsx2gs.dll) as the raster back end (docs/GS_PCSX2.md, phase 2). It takes the raw GIF
 // stream and the vsyncs, and presents into a child window over the game window on its own (no PresentationFrame).
 // Runs inside GSThreadedBackend: every call below happens on the GS thread, except the static ones.
-// The default renderer; PS2X_GS_RENDERER=nativo (config.ini [Video] Renderizador=nativo) keeps the port's GS, and
-// without the DLL the GPU back end stays.
 class GSPcsx2Backend final : public GSRasterBackend
 {
 public:
+    static bool Available();
     // Main thread: true when PS2X_GS_RENDERER asks for it and pcsx2gs.dll loads.
     static bool Requested();
     // Main thread, after the game window exists: creates the child window the GS renders into.
@@ -30,9 +29,17 @@ public:
     // (a Pcsx2GsMenuInput).
     static void SetMenu(void *draw, void *user);
     static void SetMenuInput(const void *input);
-    // Main thread: hides the GS image while a host UI drawn by raylib (the F1 debugger) is open.
-    static void SetHostUiVisible(bool visible);
+    enum class HostOverlay : uint8_t { Debugger = 1, Mods = 2 };
+    // Main thread: hides the GS image while any Raylib overlay is open.
+    static void SetHostUiVisible(HostOverlay overlay, bool visible);
     static bool HostUiVisible();
+    struct PreviewFrame
+    {
+        uint32_t width = 0, height = 0;
+        std::vector<uint32_t> rgba;
+    };
+    static void RequestPreview();
+    static PreviewFrame TakePreview();
     // Any thread: fields presented so far (the F3 counter's "Screen").
     static uint64_t Presents();
 
@@ -75,6 +82,7 @@ private:
 
     bool m_open = false;
     bool m_failed = false;
+    bool m_vsyncEnabled = true;
     GSTransferCommand m_download{};
     uint32_t m_downloadLeft = 0u; // bytes of the current local -> host transfer not read yet
     uint32_t m_width = 0u, m_height = 0u;

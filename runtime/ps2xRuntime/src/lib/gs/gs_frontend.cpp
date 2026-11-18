@@ -6,6 +6,7 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_async_vif.h"
 #include <atomic>
+#include <bit>
 #include <vector>
 #include <mutex>
 #include <deque>
@@ -262,6 +263,61 @@ namespace
         std::memcpy(&v, p, 8);
         return v;
     }
+
+#if !AGRESSIVE_LOGS
+    constexpr uint32_t kPackedVertexBytes = 3u * 16u;
+
+    bool packedGeometryEnabled()
+    {
+        static const bool enabled = [] {
+            const char *value = std::getenv("PS2X_GS_PACKED_GEOMETRY");
+            return !value || *value != '0';
+        }();
+        return enabled;
+    }
+
+    // Complete VU strip/fan with PRE and the PACKED STQ, RGBA, XYZF2 layout.
+    // Transfers, A+D side effects and partial tags stay in the general decoder.
+    uint32_t packedGeometryCount(const uint8_t *data, uint32_t sizeBytes, uint64_t &prim)
+    {
+        const uint64_t tag = loadLE64(data);
+        const uint32_t count = static_cast<uint32_t>(tag & 0x7fffu);
+        prim = (tag >> 47u) & 0x7ffu;
+        const uint64_t type = prim & 7u;
+        if (count == 0u || sizeBytes != 16u + count * kPackedVertexBytes ||
+            (tag >> 58u) != (3u << 2u) || (tag & (1ull << 46u)) == 0u || (tag & 0x8000u) == 0u ||
+            (type != GS_PRIM_TRISTRIP && type != GS_PRIM_TRIFAN) || (loadLE64(data + 8u) & 0xfffu) != 0x412u)
+            return 0u;
+        return count;
+    }
+
+    inline GSVertex decodePackedVertex(const uint8_t *data, uint16_t u, uint16_t v)
+    {
+        const uint64_t st = loadLE64(data);
+        const uint64_t q = loadLE64(data + 8u);
+        const uint64_t rg = loadLE64(data + 16u);
+        const uint64_t ba = loadLE64(data + 24u);
+        const uint64_t xy = loadLE64(data + 32u);
+        const uint64_t zf = loadLE64(data + 40u);
+        GSVertex vertex;
+        vertex.s = std::bit_cast<float>(static_cast<uint32_t>(st));
+        vertex.t = std::bit_cast<float>(static_cast<uint32_t>(st >> 32u));
+        vertex.q = std::bit_cast<float>(static_cast<uint32_t>(q));
+        if (vertex.q == 0.0f)
+            vertex.q = 1.0f;
+        vertex.r = static_cast<uint8_t>(rg);
+        vertex.g = static_cast<uint8_t>(rg >> 32u);
+        vertex.b = static_cast<uint8_t>(ba);
+        vertex.a = static_cast<uint8_t>(ba >> 32u);
+        vertex.x = static_cast<float>(xy & 0xffffu) / 16.0f;
+        vertex.y = static_cast<float>((xy >> 32u) & 0xffffu) / 16.0f;
+        vertex.z = static_cast<float>((zf >> 4u) & 0xffffffu);
+        vertex.fog = static_cast<uint8_t>(zf >> 36u);
+        vertex.u = u;
+        vertex.v = v;
+        return vertex;
+    }
+#endif
 
     struct PackedGifPacketTag
     {
@@ -872,6 +928,44 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             return;
         }
     }
+
+#if !AGRESSIVE_LOGS
+    if (m_rawGif && !g_gifCont.active && packedGeometryEnabled())
+    {
+        uint64_t prim;
+        if (const uint32_t count = packedGeometryCount(data, sizeBytes, prim))
+        {
+            recordGifTagDebugEventUnlocked(sizeBytes, count, GIF_FMT_PACKED, 3u);
+            writeRegisterUnlocked(GS_REG_PRIM, prim);
+
+            // The GPU backend consumes the draw. Keep the frontend's observable
+            // latches and primitive tail without assembling every triangle again.
+            const uint8_t *const vertices = data + 16u;
+            const auto last = decodePackedVertex(vertices + (count - 1u) * kPackedVertexBytes, m_curU, m_curV);
+            m_curR = last.r;
+            m_curG = last.g;
+            m_curB = last.b;
+            m_curA = last.a;
+            m_curS = last.s;
+            m_curT = last.t;
+            m_curQ = last.q;
+            m_vtxCount = static_cast<int>(std::min(count, 2u));
+            m_vtxIndex = static_cast<int>(count);
+            m_vtxQueue[m_vtxCount - 1] = last;
+            if (count >= 2u)
+            {
+                const uint32_t first = m_prim.type == GS_PRIM_TRISTRIP ? count - 2u : 0u;
+                m_vtxQueue[0] = decodePackedVertex(vertices + first * kPackedVertexBytes, m_curU, m_curV);
+            }
+            if (count >= 3u)
+                m_vtxQueue[2] = last;
+
+            m_backend->RawGif(data, sizeBytes);
+            m_backend->Flush();
+            return;
+        }
+    }
+#endif
 
     if (!g_gifCont.active && tryProcessNativeImageUploadPacket(data, sizeBytes))
     {
@@ -2111,6 +2205,17 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
     m_backend = std::move(backend);
     m_rawGif = m_backend->WantsRawGif();
     m_backend->Initialize(m_localMemoryStorage, m_localMemorySize);
+}
+
+void GS::releaseRasterBackend()
+{
+    std::unique_ptr<GSRasterBackend> backend;
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+        backend = std::move(m_backend);
+        m_rawGif = false;
+    }
 }
 
 uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const

@@ -199,10 +199,10 @@ namespace
 
         if (!g_cdImageSizeValid || g_cdImageSizePath != imagePath)
         {
-            std::error_code ec;
-            g_cdImageSizeBytes = static_cast<uint64_t>(std::filesystem::file_size(imagePath, ec));
+            auto &disc = PS2CdImage::instance();
+            g_cdImageSizeValid = disc.ensureOpenFromIoPaths();
+            g_cdImageSizeBytes = g_cdImageSizeValid ? disc.sizeBytes() : 0;
             g_cdImageSizePath = imagePath;
-            g_cdImageSizeValid = !ec;
         }
         if (!g_cdImageSizeValid)
         {
@@ -506,6 +506,13 @@ namespace
             }
 
             const uint64_t offset = static_cast<uint64_t>(lbn) * kCdSectorSize;
+            auto &disc = PS2CdImage::instance();
+            if (disc.ensureOpenFromIoPaths() && disc.isInstalled())
+            {
+                const bool ok = disc.read(offset, dst, byteCount);
+                g_lastCdError = ok ? 0 : -1;
+                return ok;
+            }
             return readHostRange(cdImage, offset, dst, byteCount);
         }
 

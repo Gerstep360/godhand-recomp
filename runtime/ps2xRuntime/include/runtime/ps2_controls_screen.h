@@ -1,11 +1,21 @@
 #pragma once
 
-// Controls screen (F1, or Back+Start on a controller): rebinds player 1's keyboard, mouse and controller in game, like
-// Tokyo Jungle's. Drawn by the host over the game image (the game never sees it); while it is open every pad is idle,
-// and after it closes each player stays idle until released. Edits go to the controls file (ps2_input_options.h
-// setControlsFile) on close. Everything here runs on the window thread.
+// Player 1 input capture and persistence, on the window thread. Ports can use nativePresentation/nativeView to draw
+// these bindings inside a guest menu instead of using the default host overlay. While editing, guest pads are idle;
+// closing saves the controls file and holds input until the physical controls are released.
+struct Font;
+#include <array>
+#include <string>
+#include <vector>
 namespace ps2x::controls
 {
+    struct NativeView { int row = 0, column = 0; bool capturing = false; std::string status; std::vector<std::array<std::string, 5>> rows; };
+    void setNativePresentation(bool enabled);
+    void setNativePageInput(bool enabled);
+    NativeView nativeView();
+    void saveAndClose();
+    void requestOpen();
+    void setFont(const Font *font);
     [[nodiscard]] bool isOpen() noexcept;
     // Once per host frame, before ps2_host_input::sample(). drawable = false (PCSX2's GS covers this window): the
     // screen does not open, so input is never blocked behind an invisible screen.

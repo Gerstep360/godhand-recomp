@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstring>
 #include <fstream>
+#include <chrono>
 
 namespace godhand
 {
@@ -81,6 +82,32 @@ namespace godhand
             }
             return true;
         }
+
+        bool checkContent(const PS2CdImage &image, std::vector<uint8_t> &bootElf, std::string &error)
+        {
+            std::vector<uint8_t> systemCnf;
+            if (!readWholeFile(image, "SYSTEM.CNF", systemCnf) || !cnfBootsGodHand(systemCnf))
+            {
+                error = std::string("SYSTEM.CNF does not boot ") + kSystemCnfBoot + "; expected " + kSerial;
+                return false;
+            }
+            if (!checkDiscFiles(image, error))
+                return false;
+            if (!readWholeFile(image, kBootElfPath, bootElf))
+            {
+                error = std::string("boot executable ") + kBootElfPath + " missing";
+                return false;
+            }
+            const std::string bootHash = Sha256::hex(bootElf.data(), bootElf.size());
+            if (bootHash != kBootElfSha256)
+            {
+                error = std::string("boot executable hash mismatch (") + bootHash +
+                        "); the recompiled code was built from " + kSerial + " " + kBootElfSha256;
+                return false;
+            }
+            GH_INFO(Boot, kBootElfPath << " sha256 " << bootHash << " (matches " << kSerial << ")");
+            return true;
+        }
     }
 
     std::filesystem::path findDiscImage(const std::vector<std::filesystem::path> &searchRoots)
@@ -109,34 +136,9 @@ namespace godhand
             return result;
         }
 
-        std::vector<uint8_t> systemCnf;
-        if (!readWholeFile(image, "SYSTEM.CNF", systemCnf))
-        {
-            result.error = "SYSTEM.CNF not found; this is not a PS2 game disc";
-            return result;
-        }
-        if (!cnfBootsGodHand(systemCnf))
-        {
-            result.error = std::string("SYSTEM.CNF does not boot ") + kSystemCnfBoot + "; expected " + kGameTitle + " (" + kSerial + ")";
-            return result;
-        }
-        if (!checkDiscFiles(image, result.error))
-            return result;
-
         std::vector<uint8_t> bootElf;
-        if (!readWholeFile(image, kBootElfPath, bootElf))
-        {
-            result.error = std::string("boot executable ") + kBootElfPath + " missing";
+        if (!checkContent(image, bootElf, result.error))
             return result;
-        }
-        const std::string bootHash = Sha256::hex(bootElf.data(), bootElf.size());
-        if (bootHash != kBootElfSha256)
-        {
-            result.error = std::string("boot executable hash mismatch (") + bootHash + "); the recompiled code was built from " +
-                           kSerial + " " + kBootElfSha256;
-            return result;
-        }
-        GH_INFO(Boot, kBootElfPath << " sha256 " << bootHash << " (matches " << kSerial << ")");
 
         std::error_code error;
         std::filesystem::create_directories(cacheDir, error);
@@ -150,5 +152,82 @@ namespace godhand
         }
         result.ok = true;
         return result;
+    }
+
+    DiscCheckResult openInstalledData(const std::filesystem::path &directory)
+    {
+        DiscCheckResult result;
+        PS2CdImage &source = PS2CdImage::instance();
+        std::error_code ec;
+        if (!std::filesystem::is_directory(directory, ec) || !source.open(directory) || !source.isInstalled())
+        {
+            result.error = "Cannot open installed game files at " + directory.string();
+            return result;
+        }
+        std::vector<uint8_t> elf;
+        if (!checkContent(source, elf, result.error))
+            return result;
+        result.bootElfPath = source.path() / kBootElfPath;
+        result.ok = true;
+        return result;
+    }
+
+    DiscCheckResult installGameData(const std::filesystem::path &imagePath, const std::filesystem::path &directory)
+    {
+        std::error_code ec;
+        if (std::filesystem::exists(directory, ec))
+            return openInstalledData(directory);
+        auto &source = PS2CdImage::instance();
+        DiscCheckResult result;
+        if (!source.open(imagePath) || source.isInstalled())
+        {
+            result.error = "Cannot open source ISO " + imagePath.string();
+            return result;
+        }
+        std::vector<uint8_t> elf;
+        if (!checkContent(source, elf, result.error))
+            return result;
+
+        std::filesystem::create_directories(directory.parent_path(), ec);
+        if (ec)
+        {
+            result.error = "Cannot create the parent game data directory: " + ec.message();
+            return result;
+        }
+        auto staging = directory;
+        staging += ".installing-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        if (!std::filesystem::create_directory(staging, ec))
+        {
+            result.error = "Cannot create the game data staging directory: " + ec.message();
+            return result;
+        }
+        struct RemoveStaging
+        {
+            std::filesystem::path path;
+            ~RemoveStaging() { std::error_code ignored; if (!path.empty()) std::filesystem::remove_all(path, ignored); }
+        } cleanup{staging};
+
+        GH_INFO(Boot, "Installing local game files in " << directory.string());
+        if (!source.install(staging, result.error))
+            return result;
+        // Validate the extracted files before publishing. Close the mounted data
+        // first so Windows can rename the directory even if files were read.
+        const DiscCheckResult verification = openInstalledData(staging);
+        source.close();
+        if (!verification.ok)
+            return verification;
+        std::filesystem::rename(staging, directory, ec);
+        if (ec)
+        {
+            std::error_code existsError;
+            if (!std::filesystem::exists(directory, existsError))
+            {
+                result.error = "Cannot publish the game data directory: " + ec.message();
+                return result;
+            }
+        }
+        else
+            cleanup.path.clear();
+        return openInstalledData(directory);
     }
 }

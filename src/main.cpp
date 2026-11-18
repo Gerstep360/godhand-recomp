@@ -20,13 +20,19 @@
 #include "godhand/call_trace.h"
 #include "godhand/default_ini.h" // generated from godhand.ini by src/CMakeLists.txt
 #include "godhand/function_hooks.h"
+#ifdef GODHAND_WITH_EXTRAS
+#include "gh_extras/host.h"
+#include "gh_extras/game_adapter.h"
+#endif
 #include "godhand/game_disc.h"
 #include "godhand/hang_dump.h"
 #include "godhand/hle_bindings.h"
+#include "godhand/native_transforms.h"
 #include "godhand/host_window.h"
 #include "godhand/log.h"
 #include "godhand/movie_watchdog.h"
 #include "godhand/thread_policy.h"
+#include "godhand/pc_options.h"
 
 #if defined(PS2X_ENABLE_DEBUG_UI)
 #include "ps2_debug_panel.h"
@@ -36,6 +42,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -269,6 +276,7 @@ namespace
     };
     constexpr IniSetting kIniSettings[] = {
         {"game", "iso", "GODHAND_ISO"},
+        {"game", "data", "GODHAND_DATA"},
         {"run", "headless", "GODHAND_HEADLESS"},
         {"run", "timelimitseconds", "GODHAND_TIME_LIMIT_SECONDS"},
         {"run", "dumpontimelimit", "GODHAND_DUMP_ON_TIME_LIMIT"},
@@ -279,6 +287,10 @@ namespace
         {"video", "internalresolution", "PS2X_GS_SCALE"},
         {"video", "startmaximized", "GODHAND_START_MAXIMIZED"},
         {"video", "startfullscreen", "GODHAND_START_FULLSCREEN"},
+        {"video", "framelimit", "PS2X_PRESENT_FPS"},
+        {"video", "vsync", "PS2X_VSYNC"},
+        {"video", "aspectwide", "GODHAND_ASPECT_WIDE"},
+        {"audio", "stereooffsetms", "GODHAND_STEREO_OFFSET_MS"},
     };
 
     // Variables holding a path: a relative value from godhand.ini is made absolute against the exe folder (a value
@@ -296,6 +308,7 @@ namespace
     };
     constexpr PathVariable kPathVariables[] = {
         {"GODHAND_ISO", PathUse::Read},
+        {"GODHAND_DATA", PathUse::Read},
         {"GODHAND_DLL_LOG", PathUse::File},
         {"GODHAND_LOG_FILE", PathUse::File},
         {"GODHAND_DUMP_RAM", PathUse::File},
@@ -491,29 +504,39 @@ namespace
 
     void printUsage()
     {
-        std::cout << "usage: godhand [--iso <path-to-" << godhand::kSerial << ".iso>] [--headless|--window] [--time-limit <seconds>]\n"
+        std::cout << "usage: godhand [--data <installed-directory>] [--headless|--window] [--time-limit <seconds>]\n"
+                  << "       godhand --prepare-data [--iso <path-to-" << godhand::kSerial << ".iso>] [--data <output-directory>]\n"
+                  << "       --iso alone mounts the ISO directly for compatibility. Normal launch uses installed files.\n"
                   << "               [--write-settings]\n"
                   << "settings: godhand.ini next to godhand.exe (environment variables of the same name win)\n"
                   << "exit codes: 0 ok, 1 init failed, 2 no disc, 3 wrong disc, 4 CPU, 5 missing function (stop), 6 crash, 124 time limit\n";
     }
 }
 
+
 int main(int argc, char *argv[])
 {
     const fs::path exeDir = executableDirectory();
 
     // Command line first: it wins over the environment, which wins over godhand.ini.
-    fs::path iso;
+    fs::path iso, data;
+    bool prepareDataOnly = false;
     bool writeSettingsOnly = false;
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg = argv[i];
         if ((arg == "--iso" || arg == "-iso") && i + 1 < argc)
             iso = argv[++i];
+        else if (arg == "--data" && i + 1 < argc)
+            data = argv[++i];
+        else if (arg == "--prepare-data")
+            prepareDataOnly = true;
         else if (arg == "--headless")
             setEnv("GODHAND_HEADLESS", "1");
         else if (arg == "--window")
             setEnv("GODHAND_HEADLESS", "0");
+        else if (arg == "--safe-mode")
+            setEnv("GODHAND_NO_MODS", "1");
         else if (arg == "--time-limit" && i + 1 < argc)
             setEnv("GODHAND_TIME_LIMIT_SECONDS", argv[++i]);
         else if (arg == "--write-settings")
@@ -568,51 +591,70 @@ int main(int argc, char *argv[])
     }
     godhand::hangdump::startFromEnvironment();
     godhand::threadpolicy::startFromEnvironment(); // PS2X_THREAD_POLICY (godhand.ini: off)
-    startTimeLimit();                                // counts from here: covers disc check, init and the run
-
-    if (iso.empty())
-    {
-        if (const char *env = std::getenv("GODHAND_ISO"); env && *env)
-            iso = env;
-    }
-    if (iso.empty())
-    {
-        iso = godhand::findDiscImage({exeDir / "game", exeDir.parent_path() / "game", exeDir.parent_path().parent_path() / "game",
-                                      exeDir.parent_path().parent_path().parent_path() / "game", fs::current_path() / "game",
-                                      fs::current_path()});
-    }
-    if (iso.empty())
-    {
-        GH_ERROR(Boot, "no disc image found. Pass --iso <path> (or [Game] Iso=) to your own " << godhand::kGameTitle << " ("
-                                                                                               << godhand::kSerial << ") disc image.");
-        printUsage();
-        return kExitNoDisc;
-    }
 
     const fs::path cacheDir = exeDir / "game_data";
-    GH_INFO(Boot, "disc image: " << iso.string());
-    const godhand::DiscCheckResult disc = godhand::verifyDiscAndPrepare(iso, cacheDir);
+    if (data.empty())
+        if (const char *env = std::getenv("GODHAND_DATA"); env && *env)
+            data = env;
+    const bool dataWasSelected = !data.empty();
+    data = dataWasSelected ? fs::absolute(data).lexically_normal() : cacheDir / "disc";
+    const bool directIso = !iso.empty() && !prepareDataOnly && !dataWasSelected;
+    godhand::DiscCheckResult disc;
+    if (directIso)
+    {
+        GH_INFO(Boot, "disc image: " << iso.string());
+        disc = godhand::verifyDiscAndPrepare(iso, cacheDir);
+    }
+    else if (std::error_code ec; fs::exists(data, ec) || (dataWasSelected && !prepareDataOnly))
+    {
+        disc = godhand::openInstalledData(data);
+    }
+    else
+    {
+        if (iso.empty())
+            if (const char *env = std::getenv("GODHAND_ISO"); env && *env)
+                iso = env;
+        if (iso.empty())
+            iso = godhand::findDiscImage({exeDir / "game", exeDir.parent_path() / "game", exeDir.parent_path().parent_path() / "game",
+                                         exeDir.parent_path().parent_path().parent_path() / "game", fs::current_path() / "game",
+                                         fs::current_path()});
+        if (iso.empty())
+        {
+            GH_ERROR(Boot, "No installed game files at " << data.string()
+                << ". Prepare them once with --prepare-data --iso <your " << godhand::kSerial << " ISO>.");
+            return kExitNoDisc;
+        }
+        disc = godhand::installGameData(iso, data);
+    }
     if (!disc.ok)
     {
         GH_ERROR(Boot, disc.error);
         return kExitBadDisc;
     }
+    if (prepareDataOnly)
+    {
+        GH_INFO(Boot, "Game data ready at " << data.string());
+        return kExitOk;
+    }
+    if (!directIso)
+        GH_INFO(Boot, "Running from installed game files: " << data.string());
+    startTimeLimit();  // The first-time extraction is outside the gameplay time limit.
 
     PS2Runtime::IoPaths paths;
     paths.elfPath = disc.bootElfPath;
-    paths.elfDirectory = cacheDir;
+    paths.elfDirectory = disc.bootElfPath.parent_path();
     paths.hostRoot = cacheDir;
-    paths.cdRoot = cacheDir;
+    paths.cdRoot = directIso ? cacheDir : data;
     paths.mcRoot = exeDir / "memcards" / "mc0";
     // GODHAND_MC_DIR=<folder>: memory cards from another folder (test drivers use a copy).
     if (const char *mcDir = std::getenv("GODHAND_MC_DIR"); mcDir && *mcDir)
         paths.mcRoot = fs::path(mcDir) / "mc0";
     setDefaultEnv("PS2X_GS_SHADER_CACHE_DIR", (cacheDir / "gs_shaders").string());
-    paths.cdImage = fs::absolute(iso);
+    paths.cdImage = directIso ? fs::absolute(iso) : data;
     // Disc image prefetch (2026-10-18): the game's disc reads are synchronous here (sceCdRead on the EE thread), so a
     // read that misses the OS file cache stalls the game; one took 1.2 s in stage 3. Reading the whole image once in
     // the background, at the lowest thread priority, puts it in the OS cache. GODHAND_ISO_PREFETCH=0 turns it off.
-    if (!headless && envFlag("GODHAND_ISO_PREFETCH", true))
+    if (directIso && !headless && envFlag("GODHAND_ISO_PREFETCH", true))
     {
         std::thread([image = paths.cdImage]
         {
@@ -682,13 +724,18 @@ int main(int argc, char *argv[])
                 auto *panel = static_cast<PS2DebugPanel *>(userData);
                 panel->draw(rt);
                 // With PCSX2's GS its window covers this one: hidden while the debugger is open.
-                GSPcsx2Backend::SetHostUiVisible(panel->isVisible());
+                GSPcsx2Backend::SetHostUiVisible(GSPcsx2Backend::HostOverlay::Debugger,panel->isVisible());
             },
             [](PS2Runtime &, void *userData) { static_cast<PS2DebugPanel *>(userData)->shutdown(); },
             &debugPanel);
 #endif
         ps2_host_display::setStartMaximized(!headless && envFlag("GODHAND_START_MAXIMIZED", false));
         ps2_host_display::setStartFullscreen(!headless && envFlag("GODHAND_START_FULLSCREEN", false));
+        ps2_host_display::setAspect(envFlag("GODHAND_ASPECT_WIDE",false)?16.0f/9.0f:4.0f/3.0f);
+        godhand::pcoptions::install(exeDir / "godhand.ini", headless);
+#ifdef GODHAND_WITH_EXTRAS
+        gh_extras::installMenu(exeDir, headless);
+#endif
         if (!runtime.initialize(godhand::kGameTitle))
         {
             GH_ERROR(Boot, "runtime initialization failed");
@@ -713,13 +760,22 @@ int main(int argc, char *argv[])
                                                   << "; RAM dump on missing: "
                                                   << (std::getenv("PS2X_DUMP_RAM_ON_MISSING") ? std::getenv("PS2X_DUMP_RAM_ON_MISSING") : "(off)"));
         godhand::FunctionHooks::instance().attach(runtime);
+#ifdef GODHAND_WITH_EXTRAS
+        gh_extras::attachRuntime(runtime);
+        gh_extras::initializeMenu();
+#endif
+        godhand::pcoptions::installNativeHooks(runtime);
         godhand::FunctionHooks::instance().observeEntry(runtime.cpu().pc, "boot_entry", [](uint8_t *, R5900Context *, PS2Runtime *) {
             applyEeFloatingPointMode(); // on the game thread
             GH_INFO(Ee, "EE FPU host mode: round toward zero, denormals flushed");
         });
         godhand::installHleBindings(runtime); // port_prep/hle-bindings owns the God Hand table
+        godhand::installNativeTransforms();
 #if GODHAND_HAS_VU1_PROGRAMS
         registerGeneratedVu1Programs();
+#else
+        GH_WARN(Boot, "no VU AOT programs in this build: 3D uses the slow interpreter; play the affected scenes, "
+                      "then close the game and run: python -I build.py vu1");
 #endif
         godhand::installDllLoadLogger(runtime); // observe only: [DLL] lines + GODHAND_DLL_LOG CSV
         godhand::installHiresFlipCopy(runtime); // PS2X_GS_SCALE > 1 only: flip copy without the flicker filter
@@ -734,6 +790,9 @@ int main(int argc, char *argv[])
 
         GH_INFO(Boot, "starting guest at 0x" << std::hex << runtime.cpu().pc);
         runtime.run();
+#ifdef GODHAND_WITH_EXTRAS
+        gh_extras::shutdownMenu(); // std::_Exit below bypasses destructors.
+#endif
 
         int code = kExitOk;
         const char *reason = "the runtime returned";
@@ -755,6 +814,9 @@ int main(int argc, char *argv[])
     }
     catch (const std::exception &e)
     {
+#ifdef GODHAND_WITH_EXTRAS
+        gh_extras::shutdownMenu();
+#endif
         GH_ERROR(Boot, "fatal: " << e.what());
         std::cout.flush();
         std::fflush(stderr);

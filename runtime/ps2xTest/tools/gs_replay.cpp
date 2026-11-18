@@ -1,3 +1,4 @@
+#include "ps2_runtime.h" // before gs_sampler's Windows exception macros
 #include "gs_golden.h"
 #include "gs_reference_backend.h"
 #include "runtime/gs/gs_cpu_backend.h"
@@ -5,6 +6,12 @@
 #include "runtime/gs/gs_gpu_backend.h"
 #include "gs_sampler.h"
 #include "runtime/gs/gs_frontend.h"
+
+// Offline GS replay does not execute EE code, but the runtime library needs a dispatch table at link time.
+const uint32_t g_ps2RecompiledFunctionTableBase = 0u;
+const uint32_t g_ps2RecompiledFunctionTableEnd = 0u;
+const uint32_t g_ps2RecompiledFunctionTableSlotCount = 0u;
+PS2Runtime::RecompiledFunction g_ps2RecompiledFunctionTable[1] = {};
 
 #include <algorithm>
 #include <array>
