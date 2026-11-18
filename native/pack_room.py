@@ -102,8 +102,12 @@ def pack_room(parts: list[Path], destination: Path):
 
     if not room['meshes']:
         raise ValueError('El escenario empaquetado no contiene mallas.')
-    room['buffers'] = [{'byteLength': len(storage)}]
-    encoded = json.dumps(room, separators=(',', ':')).encode()
+    write_glb(room, storage, destination)
+
+
+def write_glb(document, storage, destination):
+    document['buffers'] = [{'byteLength': len(storage)}]
+    encoded = json.dumps(document, separators=(',', ':')).encode()
     encoded += b' ' * (-len(encoded) % 4)
     storage.extend(b'\0' * (-len(storage) % 4))
     with destination.open('wb') as out:

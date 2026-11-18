@@ -1,14 +1,13 @@
 """Build the PC scene assets from a local God Hand USA installation."""
 
 import argparse
-import json
 from pathlib import Path
 import shutil
-import struct
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
 
+from gene_rig import build_player
 from pack_room import pack_room
 
 
@@ -16,65 +15,44 @@ PORT = Path(__file__).resolve().parents[1]
 STUDIO = PORT.parent / 'godhand-extras' / 'studio'
 DEFAULT_DATA = PORT / 'build' / 'port' / 'bin' / 'game_data' / 'disc'
 DEFAULT_ASSETS = PORT / 'build' / 'native' / 'bin' / 'pc_assets'
+DEFAULT_GENE = PORT.parent / 'UNPACK_pl00.dat' / 'FILES'
 
 
-def sanitize_motion_glb(glb_path: Path):
-    """Filter out PS2 IK effector translations on child limb bones (e.g. ankles).
-    God Hand MOT files encode foot IK goals that dislocate knees/legs when played
-    back as raw forward-kinematics translations."""
-    data = glb_path.read_bytes()
-    if len(data) < 20:
-        return
-    magic, version, length = struct.unpack('<III', data[:12])
-    chunk_len, chunk_type = struct.unpack('<II', data[12:20])
-    gltf = json.loads(data[20:20 + chunk_len].decode('utf-8'))
-    bin_data = data[20 + chunk_len + 8:]
-
-    modified = False
-    for anim in gltf.get('animations', []):
-        new_channels = []
-        for ch in anim.get('channels', []):
-            node = ch['target'].get('node')
-            path = ch['target'].get('path')
-            # Only root (1) and pelvis (2) should have translation tracks.
-            if path == 'translation' and node not in (1, 2):
-                modified = True
-                continue
-            new_channels.append(ch)
-        anim['channels'] = new_channels
-
-    if modified:
-        new_json_bytes = json.dumps(gltf).encode('utf-8')
-        while len(new_json_bytes) % 4 != 0:
-            new_json_bytes += b' '
-        new_total_len = 12 + 8 + len(new_json_bytes) + 8 + len(bin_data)
-        header = struct.pack('<III', magic, version, new_total_len)
-        json_chunk = struct.pack('<II', len(new_json_bytes), 0x4E4F534A) + new_json_bytes
-        bin_chunk = struct.pack('<II', len(bin_data), 0x004E4942) + bin_data
-        glb_path.write_bytes(header + json_chunk + bin_chunk)
-
-
-def prepare(data: Path, output: Path):
+def prepare(data: Path, output: Path, gene: Path, player_only: bool):
     sys.path.insert(0, str(STUDIO))
     from backend.assets import Catalog
-    from backend.conversion import preview
+    from backend.conversion import converter_path, preview
 
-    ffmpeg = shutil.which('ffmpeg')
-    if not ffmpeg:
-        raise RuntimeError('Se requiere FFmpeg para convertir la pista ADX de la instalacion local.')
-
-    catalog = Catalog(data)
-    player = catalog.index['afs-1053.1']
-    motion = catalog.index['afs-1053.21']  # Gene's canonical walk animation (57 frames)
-    room = [item for item in catalog.children['afs-1156.3'] if item.tag == 'SCR']
-    if not room:
-        raise ValueError('El paquete r100 no contiene geometria SCR.')
-
+    catalog = Catalog(data) if not player_only or not gene.is_dir() else None
     output.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix='prepare-pc-', dir=output.parent) as work:
         staging = Path(work)
-        shutil.copyfile(preview(catalog, player, motion), staging / 'player.glb')
-        sanitize_motion_glb(staging / 'player.glb')
+        aliases = {'MOT_009': 'idle', 'MOT_021': 'walk', 'MOT_025': 'run', 'MOT_032': 'strike'}
+        if gene.is_dir():
+            model = staging / 'gene.glb'
+            subprocess.run([str(converter_path()), '-model', str(gene / 'MD' / 'MD_001.md'),
+                            '-textures', str(gene / 'TM3' / 'TM3_000.tm3'), '-out', str(model)], check=True)
+            sources = [(path.stem, path.read_bytes()) for path in sorted((gene / 'MOT').glob('MOT_*.mot'))]
+        else:
+            model = preview(catalog, catalog.index['afs-1053.1'])
+            sources = [(f"MOT_{int(item.id.rsplit('.', 1)[1]):03}",
+                        catalog.extract(item, staging / 'source.mot').read_bytes())
+                       for item in catalog.children['afs-1053'] if item.tag == 'MOT']
+        if not set(aliases).issubset(name for name, _ in sources):
+            raise ValueError('Faltan los MOT básicos de Gene.')
+        build_player(model, [(aliases.get(name, name), raw) for name, raw in sources], staging / 'player.glb')
+        output.mkdir(exist_ok=True)
+        if player_only:
+            (staging / 'player.glb').replace(output / 'player.glb')
+            print(f'Preparados Gene y {len(sources)} MOT en {output}')
+            return
+
+        ffmpeg = shutil.which('ffmpeg')
+        if not ffmpeg:
+            raise RuntimeError('Se requiere FFmpeg para convertir la pista ADX de la instalacion local.')
+        room = [item for item in catalog.children['afs-1156.3'] if item.tag == 'SCR']
+        if not room:
+            raise ValueError('El paquete r100 no contiene geometria SCR.')
         pack_room([preview(catalog, item) for item in room], staging / 'room.glb')
 
         # Use the clean Stage 1-1 music (Smoking Roll) from user's audio pack or afs-0066.2
@@ -96,16 +74,20 @@ def prepare(data: Path, output: Path):
         manifest = staging / 'scene.txt'
         manifest.write_text('GH-PC-SCENE-1\nroom.glb\n', encoding='ascii')
         manifest.replace(output / 'scene.txt')
-    print(f'Preparados Gene, una animacion, {len(room)} piezas del escenario y una pista estereo en {output}')
+    print(f'Preparados Gene, {len(sources)} MOT, {len(room)} piezas del escenario y una pista estereo en {output}')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--data', type=Path, default=DEFAULT_DATA)
     parser.add_argument('--output', type=Path, default=DEFAULT_ASSETS)
+    parser.add_argument('--gene-files', type=Path, default=DEFAULT_GENE)
+    parser.add_argument('--player-only', action='store_true')
     args = parser.parse_args()
     try:
-        prepare(args.data.resolve(strict=True), args.output.resolve())
+        if args.gene_files != DEFAULT_GENE and not args.gene_files.is_dir():
+            raise ValueError('No se encuentra la carpeta de archivos extraídos de Gene.')
+        prepare(args.data.resolve(), args.output.resolve(), args.gene_files.resolve(), args.player_only)
     except (ImportError, KeyError, OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f'{error}\n')
 
